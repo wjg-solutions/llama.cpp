@@ -97,6 +97,8 @@ struct slot_params {
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // mininum line indentation for the generated text in number of whitespace characters
+    int32_t beam_width = 1; // number of beams to maintain during beam search (1 = disabled)
+    bool return_beam_candidates = false; // whether to return all beam candidates in the response
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
@@ -176,6 +178,8 @@ struct slot_params {
             {"preserved_tokens",          sampling.preserved_tokens},
             {"chat_format",               common_chat_format_name(oaicompat_chat_format)},
             {"samplers",                  samplers},
+            {"beam_width",                beam_width},
+            {"return_beam_candidates",    return_beam_candidates},
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
@@ -241,6 +245,8 @@ struct server_task {
         params.n_indent         = json_value(data, "n_indent",           defaults.n_indent);
         params.n_keep           = json_value(data, "n_keep",             defaults.n_keep);
         params.n_discard        = json_value(data, "n_discard",          defaults.n_discard);
+        params.beam_width       = json_value(data, "beam_width",         defaults.beam_width);
+        params.return_beam_candidates = json_value(data, "return_beam_candidates", defaults.return_beam_candidates);
       //params.t_max_prompt_ms  = json_value(data, "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
         params.t_max_predict_ms = json_value(data, "t_max_predict_ms",   defaults.t_max_predict_ms);
         params.response_fields  = json_value(data, "response_fields",   std::vector<std::string>());
@@ -632,6 +638,7 @@ struct server_task_result_cmpl_final : server_task_result {
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
     std::vector<std::string>  response_fields;
+    json beam_results = json::array(); // Beam search results
 
     slot_params generation_params;
 
@@ -682,6 +689,11 @@ struct server_task_result_cmpl_final : server_task_result {
             {"tokens_cached",       n_tokens_cached},
             {"timings",             timings.to_json()},
         };
+        
+        // Add beam results if they exist
+        if (!beam_results.empty()) {
+            res["beam_results"] = beam_results;
+        }
         if (!stream && !probs_output.empty()) {
             res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
         }
@@ -1259,6 +1271,15 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    
+    // Beam search structure
+    struct beam_candidate {
+        std::vector<llama_token> tokens;
+        float log_probability = 0.0f;
+        std::string generated_text;
+    };
+    
+    std::vector<beam_candidate> beam_candidates;
 
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
@@ -2440,6 +2461,19 @@ struct server_context {
         res->oaicompat_model       = slot.params.oaicompat_model;
         res->oaicompat_cmpl_id     = slot.params.oaicompat_cmpl_id;
         res->oaicompat_chat_format = slot.params.oaicompat_chat_format;
+        
+        // Add beam search results if enabled
+        if (slot.params.beam_width > 1 && slot.params.return_beam_candidates) {
+            for (const auto& candidate : slot.beam_candidates) {
+                res->beam_results.push_back({
+                    {"text", candidate.generated_text},
+                    {"log_probability", candidate.log_probability},
+                    {"normalized_log_probability", candidate.tokens.empty() ? 0.0f :
+                        candidate.log_probability / static_cast<float>(candidate.tokens.size())},
+                    {"tokens", candidate.tokens}
+                });
+            }
+        }
         // populate res.probs_output
         if (slot.params.sampling.n_probs > 0) {
             if (!slot.params.stream && slot.stop == STOP_TYPE_WORD) {
@@ -3264,7 +3298,67 @@ struct server_context {
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                llama_token id;
+                
+                // Use beam search if enabled
+                if (slot.params.beam_width > 1) {
+                    // Initialize beam candidates if first generation step
+                    if (slot.n_decoded == 0) {
+                        // Start with a single empty candidate
+                        slot.beam_candidates.clear();
+                        slot.beam_candidates.push_back({
+                            /* tokens */ {},
+                            /* log_probability */ 0.0f,
+                            /* generated_text */ ""
+                        });
+                    }
+                    
+                    // Expand all current beam candidates
+                    std::vector<server_slot::beam_candidate> new_candidates;
+                    
+                    for (const auto& candidate : slot.beam_candidates) {
+                        // Get top-k token probabilities for the current context
+                        const auto* candidates_data = common_sampler_get_candidates(slot.smpl);
+                        const size_t top_k = std::min((size_t)(slot.params.beam_width * 2), candidates_data->size);
+                        
+                        for (size_t i = 0; i < top_k; i++) {
+                            server_slot::beam_candidate new_candidate = candidate;
+                            llama_token new_token = candidates_data->data[i].id;
+                            float token_log_prob = logf(candidates_data->data[i].p);
+                            
+                            // Add the new token to this candidate
+                            new_candidate.tokens.push_back(new_token);
+                            new_candidate.log_probability += token_log_prob;
+                            new_candidate.generated_text += common_token_to_piece(
+                                ctx,
+                                new_token,
+                                accept_special_token(slot, new_token)
+                            );
+                            
+                            new_candidates.push_back(new_candidate);
+                        }
+                    }
+                    
+                    // Sort candidates by log probability
+                    std::sort(new_candidates.begin(), new_candidates.end(),
+                        [](const server_slot::beam_candidate& a, const server_slot::beam_candidate& b) {
+                            return a.log_probability > b.log_probability;
+                        });
+                    
+                    // Keep only the top beam_width candidates
+                    if (new_candidates.size() > (size_t)slot.params.beam_width) {
+                        new_candidates.resize(slot.params.beam_width);
+                    }
+                    
+                    // Update beam candidates
+                    slot.beam_candidates = std::move(new_candidates);
+                    
+                    // Use the best beam's token for the next step
+                    id = slot.beam_candidates[0].tokens.back();
+                } else {
+                    // Original token sampling logic
+                    id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                }
 
                 slot.i_batch = -1;
 

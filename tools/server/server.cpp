@@ -4301,12 +4301,12 @@ int main(int argc, char ** argv) {
         }
 
         auto body = json::parse(req.body);
-        SRV_INF("Chat completions: parsing request with use_jinja=%d, reasoning_format=%s",
-                params.use_jinja, params.reasoning_format.c_str());
+        // Removed reasoning_format from this log as it's an enum and cannot be printed with %s
+        SRV_INF("Chat completions: parsing request with use_jinja=%d",
+                params.use_jinja);
         SRV_INF("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
         
-        SRV_INF("Chat completions: parsing request with use_jinja=%d", params.use_jinja);
-        SRV_INF("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
+        // Duplicate logs removed for clarity
         
         json data = oaicompat_completion_params_parse(body, params.use_jinja, params.reasoning_format, ctx_server.chat_templates.get());
         

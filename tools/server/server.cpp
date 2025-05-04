@@ -97,7 +97,7 @@ struct slot_params {
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // mininum line indentation for the generated text in number of whitespace characters
-    int32_t beam_width = 1; // number of beams to maintain during beam search (1 = disabled)
+    int32_t beam_width = 4; // number of beams to maintain during beam search (1 = disabled)
     bool return_beam_candidates = false; // whether to return all beam candidates in the response
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement

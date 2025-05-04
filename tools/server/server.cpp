@@ -3362,6 +3362,9 @@ struct server_context {
                         }
 
                         // Update beam candidates
+                        SRV_INF("Beam search: selected %zu best candidates out of %zu",
+                              std::min(new_candidates.size(), (size_t)slot.params.beam_width),
+                              new_candidates.size());
                         slot.beam_candidates = std::move(new_candidates);
 
                         // Use the best beam's token for the next step
@@ -3370,6 +3373,10 @@ struct server_context {
                              id = llama_vocab_eos(vocab); // Fallback
                         } else {
                             id = slot.beam_candidates[0].tokens.back();
+                            SRV_INF("Beam search: selected best token %d with log_prob %.6f",
+                                  id, slot.beam_candidates[0].log_probability);
+                            SRV_INF("Beam search: selected best token %d with log_prob %.6f",
+                                  id, slot.beam_candidates[0].log_probability);
                         }
                     }
                     // No need to free a clone anymore
@@ -4077,8 +4084,25 @@ int main(int argc, char ** argv) {
 
         auto completion_id = gen_chatcmplid();
         std::unordered_set<int> task_ids;
+        SRV_INF("Completions: processing request with type=%d, oaicompat=%d, beam_width=%d, stream=%d",
+                type, oaicompat,
+                data.contains("beam_width") ? data["beam_width"].get<int>() : 0,
+                data.contains("stream") ? data["stream"].get<bool>() : false);
+        SRV_INF("Completions: processing request with type=%d, oaicompat=%d, beam_width=%d, stream=%d",
+                type, oaicompat,
+                data.contains("beam_width") ? data["beam_width"].get<int>() : 0,
+                data.contains("stream") ? data["stream"].get<bool>() : false);
         try {
             std::vector<server_task> tasks;
+            
+            // Log key parameters for debugging
+            if (data.contains("beam_width")) {
+                LOG_INF("Request contains beam_width=%d", data["beam_width"].get<int>());
+            }
+            
+            if (data.contains("stream")) {
+                LOG_INF("Request contains stream=%s", data["stream"].get<bool>() ? "true" : "false");
+            }
 
             const auto & prompt = data.at("prompt");
             // TODO: this log can become very long, put it behind a flag or think about a more compact format
@@ -4277,7 +4301,20 @@ int main(int argc, char ** argv) {
         }
 
         auto body = json::parse(req.body);
+        SRV_INF("Chat completions: parsing request with use_jinja=%d, reasoning_format=%s",
+                params.use_jinja, params.reasoning_format.c_str());
+        SRV_INF("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
+        
+        SRV_INF("Chat completions: parsing request with use_jinja=%d", params.use_jinja);
+        SRV_INF("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
+        
         json data = oaicompat_completion_params_parse(body, params.use_jinja, params.reasoning_format, ctx_server.chat_templates.get());
+        
+        SRV_INF("Chat completions: processed prompt length: %d chars",
+                data.contains("prompt") ? (int)data["prompt"].get<std::string>().size() : 0);
+        
+        SRV_INF("Chat completions: processed prompt length: %d chars",
+                data.contains("prompt") ? (int)data["prompt"].get<std::string>().size() : 0);
 
         return handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,

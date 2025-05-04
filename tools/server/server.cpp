@@ -3299,70 +3299,100 @@ struct server_context {
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id;
-                
+
                 // Use beam search if enabled
                 if (slot.params.beam_width > 1) {
                     // Initialize beam candidates if first generation step
                     if (slot.n_decoded == 0) {
-                        // Start with a single empty candidate
                         slot.beam_candidates.clear();
-                        slot.beam_candidates.push_back({
-                            /* tokens */ {},
-                            /* log_probability */ 0.0f,
-                            /* generated_text */ ""
-                        });
+                        slot.beam_candidates.push_back({{}, 0.0f, ""});
                     }
-                    
-                    // Expand all current beam candidates
+
                     std::vector<server_slot::beam_candidate> new_candidates;
-                    
-                    for (const auto& candidate : slot.beam_candidates) {
-                        // Get top-k token probabilities for the current context
-                        const auto* candidates_data = common_sampler_get_candidates(slot.smpl);
-                        const size_t top_k = std::min((size_t)(slot.params.beam_width * 2), candidates_data->size);
-                        
-                        for (size_t i = 0; i < top_k; i++) {
-                            server_slot::beam_candidate new_candidate = candidate;
-                            llama_token new_token = candidates_data->data[i].id;
-                            float token_log_prob = logf(candidates_data->data[i].p);
-                            
-                            // Add the new token to this candidate
-                            new_candidate.tokens.push_back(new_token);
-                            new_candidate.log_probability += token_log_prob;
-                            new_candidate.generated_text += common_token_to_piece(
-                                ctx,
-                                new_token,
-                                accept_special_token(slot, new_token)
-                            );
-                            
-                            new_candidates.push_back(new_candidate);
+
+                    // Get candidate probabilities using the new function
+                    if (!slot.smpl) {
+                        SLT_ERR(slot, "Sampler (slot.smpl) is null!%s", "");
+                        break; // Critical error
+                    }
+                    // Use the new function to get probabilities *before* final sampling
+                    llama_token_data_array * candidates_probs = common_sampler_get_candidate_probs(slot.smpl, ctx, tok_idx);
+
+                    if (!candidates_probs || candidates_probs->size == 0) {
+                        SLT_ERR(slot, "common_sampler_get_candidate_probs returned null or empty!%s", "");
+                        id = llama_vocab_eos(vocab); // Fallback
+                        slot.beam_candidates.clear(); // Clear candidates to signal error state below
+                    } else {
+                        // Apply final sampling steps (like temperature) manually if needed,
+                        // or assume they are implicitly handled/not needed for beam search score.
+                        // For simplicity, we'll use the probabilities directly for now.
+                        // TODO: Re-apply temperature or other final steps if required by the specific beam search variant.
+
+                        const size_t top_k = std::min((size_t)(slot.params.beam_width * 2), candidates_probs->size);
+
+                        // Expand all current beam candidates using the fetched probabilities
+                        for (const auto& candidate : slot.beam_candidates) {
+                            for (size_t k_idx = 0; k_idx < top_k; k_idx++) {
+                                server_slot::beam_candidate new_candidate = candidate;
+                                llama_token new_token = candidates_probs->data[k_idx].id;
+                                float token_prob = candidates_probs->data[k_idx].p; // Use probability directly
+                                float token_log_prob = (token_prob > 0.0f) ? logf(token_prob) : -INFINITY;
+
+                                new_candidate.tokens.push_back(new_token);
+                                new_candidate.log_probability += token_log_prob;
+                                new_candidate.generated_text += common_token_to_piece(
+                                    ctx, new_token, accept_special_token(slot, new_token)
+                                );
+                                new_candidates.push_back(new_candidate);
+                            }
+                        }
+
+                        // Sort candidates by log probability
+                        std::sort(new_candidates.begin(), new_candidates.end(),
+                            [](const server_slot::beam_candidate& a, const server_slot::beam_candidate& b) {
+                                if (std::isnan(a.log_probability) || std::isnan(b.log_probability)) return false;
+                                if (std::isinf(a.log_probability) && a.log_probability < 0) return false;
+                                if (std::isinf(b.log_probability) && b.log_probability < 0) return true;
+                                return a.log_probability > b.log_probability;
+                            });
+
+                        // Keep only the top beam_width candidates
+                        if (new_candidates.size() > (size_t)slot.params.beam_width) {
+                            new_candidates.resize(slot.params.beam_width);
+                        }
+
+                        // Update beam candidates
+                        slot.beam_candidates = std::move(new_candidates);
+
+                        // Use the best beam's token for the next step
+                        if (slot.beam_candidates.empty() || slot.beam_candidates[0].tokens.empty()) {
+                             SLT_ERR(slot, "Beam candidates empty or best candidate has no tokens after update!%s", "");
+                             id = llama_vocab_eos(vocab); // Fallback
+                        } else {
+                            id = slot.beam_candidates[0].tokens.back();
                         }
                     }
-                    
-                    // Sort candidates by log probability
-                    std::sort(new_candidates.begin(), new_candidates.end(),
-                        [](const server_slot::beam_candidate& a, const server_slot::beam_candidate& b) {
-                            return a.log_probability > b.log_probability;
-                        });
-                    
-                    // Keep only the top beam_width candidates
-                    if (new_candidates.size() > (size_t)slot.params.beam_width) {
-                        new_candidates.resize(slot.params.beam_width);
-                    }
-                    
-                    // Update beam candidates
-                    slot.beam_candidates = std::move(new_candidates);
-                    
-                    // Use the best beam's token for the next step
-                    id = slot.beam_candidates[0].tokens.back();
+                    // No need to free a clone anymore
                 } else {
-                    // Original token sampling logic
-                    id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                    // Original token sampling logic (remains unchanged)
+                    if (!slot.smpl) {
+                         SLT_ERR(slot, "Sampler (slot.smpl) is null!%s", "");
+                         id = llama_vocab_eos(vocab); // Fallback
+                    } else {
+                        // Sample using the original sampler
+                        id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                    }
                 }
 
                 slot.i_batch = -1;
 
-                common_sampler_accept(slot.smpl, id, true);
+                // Accept the chosen token (either from beam search or original sampling)
+                // into the ORIGINAL sampler state
+                if (!slot.smpl) {
+                    SLT_ERR(slot, "Original sampler (slot.smpl) is null before accept!%s", "");
+                } else {
+                    common_sampler_accept(slot.smpl, id, true);
+                }
 
                 slot.n_decoded += 1;
 

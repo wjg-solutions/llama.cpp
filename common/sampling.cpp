@@ -316,6 +316,11 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     llama_sampler_reset(gsmpl->chain);
 }
 
+void common_sampler_reset_candidates(struct common_sampler * gsmpl) {
+    gsmpl->cur_p.sorted = false;
+    gsmpl->cur_p.selected = -1;
+}
+
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params = */ gsmpl->params,
@@ -428,6 +433,50 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
 }
 
 // helpers
+
+// Get candidate probabilities after applying the main sampler chain (penalties, biases, etc.)
+// but *before* final distribution sampling (e.g., temp, mirostat, dist).
+// The caller is responsible for applying final sampling methods if needed.
+// Returns pointer to internal candidate data - DO NOT FREE. Returns nullptr on error.
+llama_token_data_array * common_sampler_get_candidate_probs(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    if (!gsmpl || !ctx) {
+        return nullptr;
+    }
+
+    gsmpl->set_logits(ctx, idx);
+
+    auto & chain = gsmpl->chain;
+    auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    // Apply all samplers in the chain *except* the final distribution sampler
+    // This assumes the distribution sampler (dist, mirostat) is the last one.
+    // A more robust implementation might check sampler names/types.
+    const int n_samplers = llama_sampler_chain_n(chain);
+    if (n_samplers <= 0) {
+        // No samplers to apply, return raw logits (after set_logits)
+        return &cur_p;
+    }
+
+    for (int i = 0; i < n_samplers - 1; ++i) {
+        const auto * smpl_const = llama_sampler_chain_get(chain, i);
+        // Clone the individual sampler to get a non-const version for apply
+        struct llama_sampler * smpl_clone = llama_sampler_clone(smpl_const);
+        if (!smpl_clone) {
+             // Handle error - maybe log and continue?
+             fprintf(stderr, "%s: Failed to clone sampler %d in chain\n", __func__, i);
+             continue;
+        }
+        llama_sampler_apply(smpl_clone, &cur_p);
+        // Free the cloned individual sampler immediately after use
+        llama_sampler_free(smpl_clone);
+    }
+
+    // We don't apply the last sampler (distribution) or grammar here.
+    // We also don't set cur_p.selected.
+
+    return &cur_p;
+}
+
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl) {
     return &gsmpl->cur_p;

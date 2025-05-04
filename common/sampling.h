@@ -43,6 +43,8 @@ void common_sampler_free(struct common_sampler * gsmpl);
 // if accept_grammar is true, the token is accepted both by the sampling chain and the grammar
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
+// Reset the candidate state (sorted = false, selected = -1)
+void                    common_sampler_reset_candidates(struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
 // arguments can be nullptr to skip printing
@@ -86,7 +88,14 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // helpers
 
 // access the internal list of current candidate tokens
+// NOTE: This might reflect state after sampling methods (top-k, top-p) have been applied.
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl);
+
+// Get candidate probabilities after applying the main sampler chain (penalties, biases, etc.)
+// but *before* final distribution sampling (e.g., temp, mirostat, dist).
+// The caller is responsible for applying final sampling methods if needed.
+// Returns pointer to internal candidate data - DO NOT FREE. Returns nullptr on error.
+llama_token_data_array * common_sampler_get_candidate_probs(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
 
 // get the last accepted token
 llama_token common_sampler_last(const struct common_sampler * gsmpl);

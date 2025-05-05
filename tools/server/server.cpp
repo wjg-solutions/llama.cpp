@@ -97,7 +97,7 @@ struct slot_params {
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // mininum line indentation for the generated text in number of whitespace characters
-    int32_t beam_width = 4; // number of beams to maintain during beam search (1 = disabled)
+    int32_t beam_width = 1; // number of beams to maintain during beam search (1 = disabled)
     bool return_beam_candidates = false; // whether to return all beam candidates in the response
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
@@ -246,6 +246,12 @@ struct server_task {
         params.n_keep           = json_value(data, "n_keep",             defaults.n_keep);
         params.n_discard        = json_value(data, "n_discard",          defaults.n_discard);
         params.beam_width       = json_value(data, "beam_width",         defaults.beam_width);
+        // Override request beam width with server beam width if it exists and is greater than 0
+        if (params_base.beam_width > 0) {
+            SRV_DBG("using server beam_width = %d (overriding request value = %d)\n",
+                params_base.beam_width, params.beam_width);
+            params.beam_width = params_base.beam_width;
+        }
         params.return_beam_candidates = json_value(data, "return_beam_candidates", defaults.return_beam_candidates);
       //params.t_max_prompt_ms  = json_value(data, "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
         params.t_max_predict_ms = json_value(data, "t_max_predict_ms",   defaults.t_max_predict_ms);

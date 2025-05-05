@@ -1425,6 +1425,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_PREDICT"));
     add_opt(common_arg(
+        {"--beams"}, "N",
+        string_format("beam width for beam search decoding (default: %d, 1 = greedy)", params.beam_width),
+        [](common_params & params, int value) {
+            params.beam_width = value;
+        }
+    ).set_env("LLAMA_ARG_BEAMS"));
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

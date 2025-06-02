@@ -2885,6 +2885,95 @@ struct server_context {
         }
     }
 
+private:
+    // Helper function to perform a single step of beam search for a given slot.
+    // Modifies slot.beam_candidates and returns the chosen token ID for the current step.
+    llama_token _perform_beam_search_step(
+        server_slot &slot,
+        int tok_idx, // Index of the token in the current batch view for which to get logits
+        const std::function<bool(server_slot &, llama_token)>& accept_special_token_fn
+    ) {
+        llama_token id; // The token ID to be returned
+
+        // Initialize beam candidates if this is the first generation step for this slot
+        if (slot.n_decoded == 0) {
+            slot.beam_candidates.clear();
+            // Start with a single empty candidate with log probability 0
+            slot.beam_candidates.push_back({{}, 0.0f, ""});
+        }
+
+        std::vector<server_slot::beam_candidate> new_candidates; // Stores candidates for the next step
+
+        // Ensure the sampler is available
+        if (!slot.smpl) {
+            SLT_ERR(slot, "Sampler (slot.smpl) is null during beam search!%s", "");
+            return llama_vocab_eos(this->vocab); // Fallback to EOS token
+        }
+        
+        // Get pre-sampler candidate probabilities for the current token index
+        llama_token_data_array * candidates_probs = common_sampler_get_candidate_probs(slot.smpl, this->ctx, tok_idx);
+
+        if (!candidates_probs || candidates_probs->size == 0) {
+            SLT_ERR(slot, "common_sampler_get_candidate_probs returned null or empty during beam search!%s", "");
+            id = llama_vocab_eos(this->vocab); // Fallback
+            slot.beam_candidates.clear();      // Signal an error state by clearing candidates
+        } else {
+            // Determine how many top-k candidates to consider for expansion (e.g., 2 * beam_width)
+            const size_t top_k_expansion = std::min((size_t)(slot.params.beam_width * 2), candidates_probs->size);
+
+            // Expand each current beam by the top_k_expansion candidate tokens
+            for (const auto& current_beam : slot.beam_candidates) {
+                for (size_t k_idx = 0; k_idx < top_k_expansion; k_idx++) {
+                    server_slot::beam_candidate new_beam_candidate = current_beam; // Copy current beam
+                    llama_token new_token_id = candidates_probs->data[k_idx].id;
+                    float token_prob = candidates_probs->data[k_idx].p; 
+                    float token_log_prob = (token_prob > 0.0f) ? logf(token_prob) : -INFINITY; // Convert probability to log_probability
+
+                    // Update the new candidate
+                    new_beam_candidate.tokens.push_back(new_token_id);
+                    new_beam_candidate.log_probability += token_log_prob;
+                    new_beam_candidate.generated_text += common_token_to_piece(
+                        this->ctx, new_token_id, accept_special_token_fn(slot, new_token_id)
+                    );
+                    new_candidates.push_back(new_beam_candidate);
+                }
+            }
+
+            // Sort all expanded candidates by their log probability in descending order
+            std::sort(new_candidates.begin(), new_candidates.end(),
+                [](const server_slot::beam_candidate& a, const server_slot::beam_candidate& b) {
+                    // Handle NaN and -Infinity cases for robust sorting
+                    if (std::isnan(a.log_probability) || std::isnan(b.log_probability)) return false;
+                    if (std::isinf(a.log_probability) && a.log_probability < 0) return false; // a is -inf, b is not (or also -inf)
+                    if (std::isinf(b.log_probability) && b.log_probability < 0) return true;  // b is -inf, a is not
+                    return a.log_probability > b.log_probability; // Higher log_prob is better
+                });
+
+            // Prune the candidates to keep only the top beam_width
+            if (new_candidates.size() > (size_t)slot.params.beam_width) {
+                new_candidates.resize(slot.params.beam_width);
+            }
+
+            SRV_DBG("Beam search: selected %zu best candidates out of %zu expanded candidates",
+                  std::min(new_candidates.size(), (size_t)slot.params.beam_width),
+                  new_candidates.size()); // Log actual size before potential resize if fewer than beam_width
+            
+            slot.beam_candidates = std::move(new_candidates); // Update the slot's beam candidates
+
+            // The token for the next step is the last token of the current best beam
+            if (slot.beam_candidates.empty() || slot.beam_candidates[0].tokens.empty()) {
+                 SLT_ERR(slot, "Beam candidates empty or best candidate has no tokens after update!%s", "");
+                 id = llama_vocab_eos(this->vocab); // Fallback
+            } else {
+                id = slot.beam_candidates[0].tokens.back();
+                SRV_DBG("Beam search: selected best token %d ('%s') with log_prob %.6f",
+                      id, common_token_to_piece(this->ctx, id).c_str(), slot.beam_candidates[0].log_probability);
+            }
+        }
+        return id; // Return the chosen token ID for this step
+    }
+
+public:
     void update_slots() {
         // check if all slots are idle
         {
@@ -3308,89 +3397,12 @@ struct server_context {
 
                 // Use beam search if enabled
                 if (slot.params.beam_width > 1) {
-                    // Initialize beam candidates if first generation step
-                    if (slot.n_decoded == 0) {
-                        slot.beam_candidates.clear();
-                        slot.beam_candidates.push_back({{}, 0.0f, ""});
-                    }
-
-                    std::vector<server_slot::beam_candidate> new_candidates;
-
-                    // Get candidate probabilities using the new function
-                    if (!slot.smpl) {
-                        SLT_ERR(slot, "Sampler (slot.smpl) is null!%s", "");
-                        break; // Critical error
-                    }
-                    // Use the new function to get probabilities *before* final sampling
-                    llama_token_data_array * candidates_probs = common_sampler_get_candidate_probs(slot.smpl, ctx, tok_idx);
-
-                    if (!candidates_probs || candidates_probs->size == 0) {
-                        SLT_ERR(slot, "common_sampler_get_candidate_probs returned null or empty!%s", "");
-                        id = llama_vocab_eos(vocab); // Fallback
-                        slot.beam_candidates.clear(); // Clear candidates to signal error state below
-                    } else {
-                        // Apply final sampling steps (like temperature) manually if needed,
-                        // or assume they are implicitly handled/not needed for beam search score.
-                        // For simplicity, we'll use the probabilities directly for now.
-                        // TODO: Re-apply temperature or other final steps if required by the specific beam search variant.
-
-                        const size_t top_k = std::min((size_t)(slot.params.beam_width * 2), candidates_probs->size);
-
-                        // Expand all current beam candidates using the fetched probabilities
-                        for (const auto& candidate : slot.beam_candidates) {
-                            for (size_t k_idx = 0; k_idx < top_k; k_idx++) {
-                                server_slot::beam_candidate new_candidate = candidate;
-                                llama_token new_token = candidates_probs->data[k_idx].id;
-                                float token_prob = candidates_probs->data[k_idx].p; // Use probability directly
-                                float token_log_prob = (token_prob > 0.0f) ? logf(token_prob) : -INFINITY;
-
-                                new_candidate.tokens.push_back(new_token);
-                                new_candidate.log_probability += token_log_prob;
-                                new_candidate.generated_text += common_token_to_piece(
-                                    ctx, new_token, accept_special_token(slot, new_token)
-                                );
-                                new_candidates.push_back(new_candidate);
-                            }
-                        }
-
-                        // Sort candidates by log probability
-                        std::sort(new_candidates.begin(), new_candidates.end(),
-                            [](const server_slot::beam_candidate& a, const server_slot::beam_candidate& b) {
-                                if (std::isnan(a.log_probability) || std::isnan(b.log_probability)) return false;
-                                if (std::isinf(a.log_probability) && a.log_probability < 0) return false;
-                                if (std::isinf(b.log_probability) && b.log_probability < 0) return true;
-                                return a.log_probability > b.log_probability;
-                            });
-
-                        // Keep only the top beam_width candidates
-                        if (new_candidates.size() > (size_t)slot.params.beam_width) {
-                            new_candidates.resize(slot.params.beam_width);
-                        }
-
-                        // Update beam candidates
-                        SRV_INF("Beam search: selected %zu best candidates out of %zu",
-                              std::min(new_candidates.size(), (size_t)slot.params.beam_width),
-                              new_candidates.size());
-                        slot.beam_candidates = std::move(new_candidates);
-
-                        // Use the best beam's token for the next step
-                        if (slot.beam_candidates.empty() || slot.beam_candidates[0].tokens.empty()) {
-                             SLT_ERR(slot, "Beam candidates empty or best candidate has no tokens after update!%s", "");
-                             id = llama_vocab_eos(vocab); // Fallback
-                        } else {
-                            id = slot.beam_candidates[0].tokens.back();
-                            SRV_INF("Beam search: selected best token %d with log_prob %.6f",
-                                  id, slot.beam_candidates[0].log_probability);
-                            SRV_INF("Beam search: selected best token %d with log_prob %.6f",
-                                  id, slot.beam_candidates[0].log_probability);
-                        }
-                    }
-                    // No need to free a clone anymore
+                    id = _perform_beam_search_step(slot, tok_idx, accept_special_token);
                 } else {
-                    // Original token sampling logic (remains unchanged)
+                    // Original token sampling logic
                     if (!slot.smpl) {
                          SLT_ERR(slot, "Sampler (slot.smpl) is null!%s", "");
-                         id = llama_vocab_eos(vocab); // Fallback
+                         id = llama_vocab_eos(this->vocab); // Fallback
                     } else {
                         // Sample using the original sampler
                         id = common_sampler_sample(slot.smpl, ctx, tok_idx);
@@ -3623,7 +3635,7 @@ int main(int argc, char ** argv) {
     svr->set_default_headers({{"Server", "llama.cpp"}});
     svr->set_logger(log_server_request);
 
-    auto res_error = [](httplib::Response & res, const json & error_data) {
+    auto res_error = [&res_error](httplib::Response & res, const json & error_data) {
         json final_response {{"error", error_data}};
         res.set_content(safe_json_to_str(final_response), MIMETYPE_JSON);
         res.status = json_value(error_data, "code", 500);
@@ -3764,7 +3776,7 @@ int main(int argc, char ** argv) {
         res_ok(res, health);
     };
 
-    const auto handle_slots = [&](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_slots = [&ctx_server, &res_error, &res_ok, &params](const httplib::Request & req, httplib::Response & res) {
         if (!params.endpoint_slots) {
             res_error(res, format_error_response("This server does not support slots endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
             return;
@@ -3803,7 +3815,7 @@ int main(int argc, char ** argv) {
         res_ok(res, res_metrics->slots_data);
     };
 
-    const auto handle_metrics = [&](const httplib::Request &, httplib::Response & res) {
+    const auto handle_metrics = [&ctx_server, &res_error, &params](const httplib::Request &, httplib::Response & res) {
         if (!params.endpoint_metrics) {
             res_error(res, format_error_response("This server does not support metrics endpoint. Start it with `--metrics`", ERROR_TYPE_NOT_SUPPORTED));
             return;
@@ -4090,24 +4102,21 @@ int main(int argc, char ** argv) {
 
         auto completion_id = gen_chatcmplid();
         std::unordered_set<int> task_ids;
-        SRV_INF("Completions: processing request with type=%d, oaicompat=%d, beam_width=%d, stream=%d",
+        SRV_DBG("Completions: processing request with type=%d, oaicompat=%d, beam_width=%d, stream=%d",
                 type, oaicompat,
                 data.contains("beam_width") ? data["beam_width"].get<int>() : 0,
                 data.contains("stream") ? data["stream"].get<bool>() : false);
-        SRV_INF("Completions: processing request with type=%d, oaicompat=%d, beam_width=%d, stream=%d",
-                type, oaicompat,
-                data.contains("beam_width") ? data["beam_width"].get<int>() : 0,
-                data.contains("stream") ? data["stream"].get<bool>() : false);
+        
         try {
             std::vector<server_task> tasks;
             
             // Log key parameters for debugging
             if (data.contains("beam_width")) {
-                LOG_INF("Request contains beam_width=%d", data["beam_width"].get<int>());
+                LOG_DBG("Request contains beam_width=%d", data["beam_width"].get<int>());
             }
             
             if (data.contains("stream")) {
-                LOG_INF("Request contains stream=%s", data["stream"].get<bool>() ? "true" : "false");
+                LOG_DBG("Request contains stream=%s", data["stream"].get<bool>() ? "true" : "false");
             }
 
             const auto & prompt = data.at("prompt");
@@ -4308,20 +4317,15 @@ int main(int argc, char ** argv) {
 
         auto body = json::parse(req.body);
         // Removed reasoning_format from this log as it's an enum and cannot be printed with %s
-        SRV_INF("Chat completions: parsing request with use_jinja=%d",
+        SRV_DBG("Chat completions: parsing request with use_jinja=%d",
                 params.use_jinja);
-        SRV_INF("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
-        
-        // Duplicate logs removed for clarity
+        SRV_DBG("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
         
         json data = oaicompat_completion_params_parse(body, params.use_jinja, params.reasoning_format, ctx_server.chat_templates.get());
         
-        SRV_INF("Chat completions: processed prompt length: %d chars",
+        SRV_DBG("Chat completions: processed prompt length: %d chars",
                 data.contains("prompt") ? (int)data["prompt"].get<std::string>().size() : 0);
         
-        SRV_INF("Chat completions: processed prompt length: %d chars",
-                data.contains("prompt") ? (int)data["prompt"].get<std::string>().size() : 0);
-
         return handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
@@ -4606,7 +4610,7 @@ int main(int argc, char ** argv) {
         res.status = 200; // HTTP OK
     };
 
-    const auto handle_lora_adapters_apply = [&](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_lora_adapters_apply = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
         const json body = json::parse(req.body);
         if (!body.is_array()) {
             res_error(res, format_error_response("Request body must be an array", ERROR_TYPE_INVALID_REQUEST));

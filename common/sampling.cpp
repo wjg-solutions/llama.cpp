@@ -205,8 +205,8 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
 
         grmr = params.grammar_lazy
              ? llama_sampler_init_grammar_lazy_patterns(vocab, params.grammar.c_str(), "root",
-                                                        trigger_patterns_c.data(), trigger_patterns_c.size(),
-                                                        trigger_tokens.data(), trigger_tokens.size())
+                                                         trigger_patterns_c.data(), trigger_patterns_c.size(),
+                                                         trigger_tokens.data(), trigger_tokens.size())
              :      llama_sampler_init_grammar(vocab, params.grammar.c_str(), "root");
         if (!grmr) {
             return nullptr;
@@ -448,22 +448,37 @@ llama_token_data_array * common_sampler_get_candidate_probs(struct common_sample
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    // Apply all samplers in the chain *except* the final distribution sampler
-    // This assumes the distribution sampler (dist, mirostat) is the last one.
-    // A more robust implementation might check sampler names/types.
     const int n_samplers = llama_sampler_chain_n(chain);
     if (n_samplers <= 0) {
         // No samplers to apply, return raw logits (after set_logits)
         return &cur_p;
     }
 
-    for (int i = 0; i < n_samplers - 1; ++i) {
+    for (int i = 0; i < n_samplers; ++i) {
         const auto * smpl_const = llama_sampler_chain_get(chain, i);
+        enum llama_sampler_type type = llama_sampler_type(smpl_const);
+
+        // Skip known distribution samplers
+        if (type == LLAMA_SAMPLER_TYPE_DIST ||
+            type == LLAMA_SAMPLER_TYPE_MIROSTAT_V1 ||
+            type == LLAMA_SAMPLER_TYPE_MIROSTAT_V2) {
+            continue;
+        }
+
         // Clone the individual sampler to get a non-const version for apply
+        // PERFORMANCE NOTE: Cloning samplers in a loop can be expensive.
+        // If performance becomes an issue, consider alternative approaches,
+        // such as a way to apply a const sampler or a temporary non-state-modifying apply.
         struct llama_sampler * smpl_clone = llama_sampler_clone(smpl_const);
         if (!smpl_clone) {
-             // Handle error - maybe log and continue?
-             fprintf(stderr, "%s: Failed to clone sampler %d in chain\n", __func__, i);
+             // ERROR HANDLING: If a sampler fails to clone, log the error and continue.
+             // This allows the function to still attempt to apply other samplers in the chain
+             // and return partially processed probabilities rather than failing entirely.
+             // Depending on the use case, a more stringent error handling (e.g., returning nullptr
+             // or a specific error code) might be considered if a partially processed result
+             // is not acceptable. For now, this provides some resilience.
+             fprintf(stderr, "%s: Failed to clone sampler %d ('%s') in chain. Skipping this sampler.\n",
+                 __func__, i, llama_sampler_name(smpl_const));
              continue;
         }
         llama_sampler_apply(smpl_clone, &cur_p);
@@ -471,7 +486,7 @@ llama_token_data_array * common_sampler_get_candidate_probs(struct common_sample
         llama_sampler_free(smpl_clone);
     }
 
-    // We don't apply the last sampler (distribution) or grammar here.
+    // We don't apply grammar here.
     // We also don't set cur_p.selected.
 
     return &cur_p;
@@ -596,7 +611,7 @@ std::vector<common_sampler_type> common_sampler_types_from_names(const std::vect
 }
 
 std::vector<common_sampler_type> common_sampler_types_from_chars(const std::string & chars) {
-    std::unordered_map<char, common_sampler_type> sampler_name_map = {
+    std.unordered_map<char, common_sampler_type> sampler_name_map = {
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_DRY),         COMMON_SAMPLER_TYPE_DRY },
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_TOP_K),       COMMON_SAMPLER_TYPE_TOP_K },
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_TYPICAL_P),   COMMON_SAMPLER_TYPE_TYPICAL_P },

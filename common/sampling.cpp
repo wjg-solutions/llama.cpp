@@ -453,12 +453,13 @@ llama_token_data_array * common_sampler_get_candidate_probs(struct common_sample
 
     for (int i = 0; i < n_samplers; ++i) {
         const auto * smpl_const = llama_sampler_chain_get(chain, i);
-        enum llama_sampler_type type = llama_sampler_type(smpl_const);
+        const char * sampler_name = llama_sampler_name(smpl_const);
 
-        // Skip known distribution samplers
-        if (type == LLAMA_SAMPLER_TYPE_DIST ||
-            type == LLAMA_SAMPLER_TYPE_MIROSTAT_V1 ||
-            type == LLAMA_SAMPLER_TYPE_MIROSTAT_V2) {
+        // Skip known distribution samplers by name
+        if (sampler_name && (
+            strcmp(sampler_name, "dist") == 0 ||
+            strcmp(sampler_name, "mirostat") == 0 ||
+            strcmp(sampler_name, "mirostat_v2") == 0)) {
             continue;
         }
 
@@ -475,7 +476,7 @@ llama_token_data_array * common_sampler_get_candidate_probs(struct common_sample
              // or a specific error code) might be considered if a partially processed result
              // is not acceptable. For now, this provides some resilience.
              fprintf(stderr, "%s: Failed to clone sampler %d ('%s') in chain. Skipping this sampler.\n",
-                 __func__, i, llama_sampler_name(smpl_const));
+                 __func__, i, sampler_name ? sampler_name : "unknown");
              continue;
         }
         llama_sampler_apply(smpl_clone, &cur_p);
@@ -614,7 +615,7 @@ std::vector<common_sampler_type> common_sampler_types_from_names(const std::vect
 }
 
 std::vector<common_sampler_type> common_sampler_types_from_chars(const std::string & chars) {
-    std.unordered_map<char, common_sampler_type> sampler_name_map = {
+    std::unordered_map<char, common_sampler_type> sampler_name_map = {
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_DRY),         COMMON_SAMPLER_TYPE_DRY },
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_TOP_K),       COMMON_SAMPLER_TYPE_TOP_K },
         { common_sampler_type_to_chr(COMMON_SAMPLER_TYPE_TYPICAL_P),   COMMON_SAMPLER_TYPE_TYPICAL_P },

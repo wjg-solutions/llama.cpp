@@ -2537,7 +2537,6 @@ struct server_context {
         res->oaicompat             = slot.params.oaicompat;
         res->oaicompat_model       = slot.params.oaicompat_model;
         res->oaicompat_cmpl_id     = slot.params.oaicompat_cmpl_id;
-        res->oaicompat_chat_format = slot.params.oaicompat_chat_format;
         
         // Add beam search results if enabled
         if (slot.params.beam_width > 1 && slot.params.return_beam_candidates) {
@@ -3848,7 +3847,7 @@ int main(int argc, char ** argv) {
     svr->set_default_headers({{"Server", "llama.cpp"}});
     svr->set_logger(log_server_request);
 
-    auto res_error = [&res_error](httplib::Response & res, const json & error_data) {
+    auto res_error = [](httplib::Response & res, const json & error_data) {
         json final_response {{"error", error_data}};
         res.set_content(safe_json_to_str(final_response), MIMETYPE_JSON);
         res.status = json_value(error_data, "code", 500);
@@ -4595,7 +4594,7 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE); // infill is not OAI compatible
     };
 
-    const auto handle_chat_completions = [&ctx_server, &res_error, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_chat_completions = [&ctx_server, &res_error, &handle_completions_impl, &params](const httplib::Request & req, httplib::Response & res) {
         LOG_DBG("request: %s\n", req.body.c_str());
         if (ctx_server.params_base.embedding) {
             res_error(res, format_error_response("This server does not support completions. Start it without `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
@@ -4608,7 +4607,7 @@ int main(int argc, char ** argv) {
                 params.use_jinja);
         SRV_DBG("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
         
-        json data = oaicompat_completion_params_parse(body, params.use_jinja, params.reasoning_format, ctx_server.chat_templates.get());
+        json data = oaicompat_completion_params_parse(body);
         
         SRV_DBG("Chat completions: processed prompt length: %d chars",
                 data.contains("prompt") ? (int)data["prompt"].get<std::string>().size() : 0);
@@ -4616,7 +4615,7 @@ int main(int argc, char ** argv) {
         return handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
-            files,
+            std::vector<raw_buffer>(),
             req.is_connection_closed,
             res,
             OAICOMPAT_TYPE_CHAT);

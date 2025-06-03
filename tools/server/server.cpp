@@ -4598,20 +4598,16 @@ int main(int argc, char ** argv) {
         }
 
         auto body = json::parse(req.body);
-        // Removed reasoning_format from this log as it's an enum and cannot be printed with %s
-        SRV_DBG("Chat completions: parsing request with use_jinja=%d",
-                params.use_jinja);
-        SRV_DBG("Chat completions: received request body: %s", req.body.substr(0, 200).c_str());
-        
-        json data = oaicompat_completion_params_parse(body);
-        
-        SRV_DBG("Chat completions: processed prompt length: %d chars",
-                data.contains("prompt") ? (int)data["prompt"].get<std::string>().size() : 0);
-        
-        return handle_completions_impl(
+        std::vector<raw_buffer> files;
+        json data = oaicompat_chat_params_parse(
+            body,
+            ctx_server.oai_parser_opt,
+            files);
+
+        handle_completions_impl(
             SERVER_TASK_TYPE_COMPLETION,
             data,
-            std::vector<raw_buffer>(),
+            files,
             req.is_connection_closed,
             res,
             OAICOMPAT_TYPE_CHAT);

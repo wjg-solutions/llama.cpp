@@ -6,6 +6,7 @@
 #include <cmath>
 #include <unordered_map>
 #include <algorithm>
+#include <cstring>
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h

@@ -98,7 +98,6 @@ struct slot_params {
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // mininum line indentation for the generated text in number of whitespace characters
     int32_t beam_width = 1; // number of beams to maintain during beam search (1 = disabled)
-    bool return_beam_candidates = false; // whether to return all beam candidates in the response
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
@@ -183,7 +182,6 @@ struct slot_params {
             {"thinking_forced_open",      oaicompat_chat_syntax.thinking_forced_open},
             {"samplers",                  samplers},
             {"beam_width",                beam_width},
-            {"return_beam_candidates",    return_beam_candidates},
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
@@ -256,7 +254,6 @@ struct server_task {
                 params_base.beam_width, params.beam_width);
             params.beam_width = params_base.beam_width;
         }
-        params.return_beam_candidates = json_value(data, "return_beam_candidates", defaults.return_beam_candidates);
       //params.t_max_prompt_ms  = json_value(data, "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
         params.t_max_predict_ms = json_value(data, "t_max_predict_ms",   defaults.t_max_predict_ms);
         params.response_fields  = json_value(data, "response_fields",   std::vector<std::string>());
@@ -2538,17 +2535,16 @@ struct server_context {
         res->oaicompat_model       = slot.params.oaicompat_model;
         res->oaicompat_cmpl_id     = slot.params.oaicompat_cmpl_id;
         
-        // Add beam search results if enabled
-        if (slot.params.beam_width > 1 && slot.params.return_beam_candidates) {
-            for (const auto& candidate : slot.beam_candidates) {
-                res->beam_results.push_back({
-                    {"text", candidate.generated_text},
-                    {"log_probability", candidate.log_probability},
-                    {"normalized_log_probability", candidate.tokens.empty() ? 0.0f :
-                        candidate.log_probability / static_cast<float>(candidate.tokens.size())},
-                    {"tokens", candidate.tokens}
-                });
-            }
+        // Add beam search results if enabled - only return the best candidate
+        if (slot.params.beam_width > 1 && !slot.beam_candidates.empty()) {
+            const auto& best_candidate = slot.beam_candidates[0]; // Best candidate is always first (sorted by log probability)
+            res->beam_results.push_back({
+                {"text", best_candidate.generated_text},
+                {"log_probability", best_candidate.log_probability},
+                {"normalized_log_probability", best_candidate.tokens.empty() ? 0.0f :
+                    best_candidate.log_probability / static_cast<float>(best_candidate.tokens.size())},
+                {"tokens", best_candidate.tokens}
+            });
         }
         // populate res.probs_output
         if (slot.params.sampling.n_probs > 0) {

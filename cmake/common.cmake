@@ -1,5 +1,13 @@
 include("ggml/cmake/common.cmake")
 
+# Find WebP package
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(WEBP REQUIRED libwebp libwebpdecoder libwebpmux)
+
+if (NOT WEBP_FOUND)
+    message(FATAL_ERROR "libwebp not found. Please install libwebp development package.")
+endif()
+
 function(llama_add_compile_flags)
     if (LLAMA_FATAL_WARNINGS)
         if (CMAKE_CXX_COMPILER_ID MATCHES "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")

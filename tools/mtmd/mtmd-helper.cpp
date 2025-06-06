@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <vector>
+#include <webp/decode.h>
 
 //#define MTMD_AUDIO_DEBUG
 
@@ -421,13 +422,30 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
         return mtmd_bitmap_init_from_audio(pcmf32.size(), pcmf32.data());
     }
 
-    // otherwise, we assume it's an image
+    // Check for WebP
+    if (len >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WEBP", 4) == 0) {
+        int width, height;
+        uint8_t* webp_data = WebPDecodeRGB(buf, len, &width, &height);
+        if (webp_data) {
+            mtmd_bitmap * result = mtmd_bitmap_init(width, height, webp_data);
+            WebPFree(webp_data);
+            if (!result) {
+                LOG_ERR("%s: failed to init mtmd_bitmap from WebP data\n", __func__);
+            }
+            return result;
+        } else {
+            LOG_ERR("%s: failed to decode WebP image\n", __func__);
+            // Fall through to stb_image if WebP decoding fails for some reason
+        }
+    }
+
+    // otherwise, we assume it's an image (or fallback from failed WebP)
     mtmd_bitmap * result = nullptr;
     {
         int nx, ny, nc;
         auto * data = stbi_load_from_memory(buf, len, &nx, &ny, &nc, 3);
         if (!data) {
-            LOG_ERR("%s: failed to decode image bytes\n", __func__);
+            LOG_ERR("%s: failed to decode image bytes using stb_image\n", __func__);
             return nullptr;
         }
         result = mtmd_bitmap_init(nx, ny, data);

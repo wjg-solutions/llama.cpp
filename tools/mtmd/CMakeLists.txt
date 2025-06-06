@@ -13,11 +13,12 @@ add_library(mtmd
             mtmd-helper.h
             )
 
-target_link_libraries     (mtmd PUBLIC ggml llama)
+# Link WebP using flags from pkg-config
+target_link_libraries     (mtmd PUBLIC ggml llama ${WEBP_LDFLAGS})
 target_link_libraries     (mtmd PRIVATE Threads::Threads)
-target_include_directories(mtmd PUBLIC  .)
+target_include_directories(mtmd PUBLIC  . ${WEBP_INCLUDE_DIRS})
 target_include_directories(mtmd PRIVATE ../..)
-target_include_directories(mtmd PRIVATE ../../vendor)
+target_include_directories(mtmd PRIVATE ../../vendor ${WEBP_INCLUDE_DIRS})
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

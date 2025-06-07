@@ -97,6 +97,10 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
 // Returns pointer to internal candidate data - DO NOT FREE. Returns nullptr on error.
 llama_token_data_array * common_sampler_get_candidate_probs(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
 
+// Optimized version for beam search that avoids expensive sampler cloning
+// Returns pointer to internal candidate data - DO NOT FREE. Returns nullptr on error.
+llama_token_data_array * common_sampler_get_candidate_probs_fast(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
+
 // get the last accepted token
 llama_token common_sampler_last(const struct common_sampler * gsmpl);
 

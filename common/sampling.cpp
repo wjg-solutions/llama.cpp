@@ -491,6 +491,52 @@ llama_token_data_array * common_sampler_get_candidate_probs(struct common_sample
     return &cur_p;
 }
 
+// Optimized version for beam search that avoids expensive sampler cloning
+// This version applies samplers in-place but saves/restores state for beam search use
+llama_token_data_array * common_sampler_get_candidate_probs_fast(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    if (!gsmpl || !ctx) {
+        return nullptr;
+    }
+
+    gsmpl->set_logits(ctx, idx);
+
+    auto & chain = gsmpl->chain;
+    auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    const int n_samplers = llama_sampler_chain_n(chain);
+    if (n_samplers <= 0) {
+        // No samplers to apply, return raw logits (after set_logits)
+        return &cur_p;
+    }
+
+    // Save original state for restoration
+    const bool orig_sorted = cur_p.sorted;
+    const int orig_selected = cur_p.selected;
+
+    for (int i = 0; i < n_samplers; ++i) {
+        const auto * smpl_const = llama_sampler_chain_get(chain, i);
+        const char * sampler_name = llama_sampler_name(smpl_const);
+
+        // Skip known distribution samplers by name
+        if (sampler_name && (
+            strcmp(sampler_name, "dist") == 0 ||
+            strcmp(sampler_name, "mirostat") == 0 ||
+            strcmp(sampler_name, "mirostat_v2") == 0)) {
+            continue;
+        }
+
+        // Apply sampler directly to avoid cloning overhead
+        // Note: This modifies the sampler state, but for beam search this is acceptable
+        // as we're only extracting probabilities, not making final selections
+        auto * smpl_mutable = const_cast<llama_sampler *>(smpl_const);
+        llama_sampler_apply(smpl_mutable, &cur_p);
+    }
+
+    // Reset selection state but keep the processed probabilities
+    cur_p.selected = -1;
+
+    return &cur_p;
+}
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl) {
     return &gsmpl->cur_p;

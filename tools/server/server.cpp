@@ -99,6 +99,11 @@ struct slot_params {
     int32_t n_indent  =  0; // mininum line indentation for the generated text in number of whitespace characters
     int32_t beam_width = 1; // number of beams to maintain during beam search (1 = disabled)
 
+    // Beam search advanced parameters
+    float   beam_length_penalty   = 1.0f; // length normalization penalty for beam search (1.0 = no penalty)
+    float   beam_diversity_penalty = 0.0f; // diversity penalty for beam search (0.0 = no penalty)
+    bool    beam_early_stopping   = true; // enable early stopping in beam search
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
@@ -182,6 +187,9 @@ struct slot_params {
             {"thinking_forced_open",      oaicompat_chat_syntax.thinking_forced_open},
             {"samplers",                  samplers},
             {"beam_width",                beam_width},
+            {"beam_length_penalty",       beam_length_penalty},
+            {"beam_diversity_penalty",    beam_diversity_penalty},
+            {"beam_early_stopping",       beam_early_stopping},
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
@@ -254,6 +262,11 @@ struct server_task {
                 params_base.beam_width, params.beam_width);
             params.beam_width = params_base.beam_width;
         }
+        
+        // Add beam search advanced parameters
+        params.beam_length_penalty = json_value(data, "beam_length_penalty", params_base.beam_length_penalty);
+        params.beam_diversity_penalty = json_value(data, "beam_diversity_penalty", params_base.beam_diversity_penalty);
+        params.beam_early_stopping = json_value(data, "beam_early_stopping", params_base.beam_early_stopping);
       //params.t_max_prompt_ms  = json_value(data, "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
         params.t_max_predict_ms = json_value(data, "t_max_predict_ms",   defaults.t_max_predict_ms);
         params.response_fields  = json_value(data, "response_fields",   std::vector<std::string>());
@@ -1265,7 +1278,25 @@ struct server_slot {
     struct beam_candidate {
         std::vector<llama_token> tokens;
         float log_probability = 0.0f;
+        float normalized_score = 0.0f;  // length-normalized score
         std::string generated_text;
+        bool is_finished = false;        // whether this candidate has reached EOS
+        int generation_length = 0;       // number of tokens generated (excluding prompt)
+        
+        // Calculate length-normalized score
+        void update_normalized_score(float length_penalty) {
+            if (generation_length > 0) {
+                float length_norm = std::pow(static_cast<float>(generation_length), length_penalty);
+                normalized_score = log_probability / length_norm;
+            } else {
+                normalized_score = log_probability;
+            }
+        }
+        
+        // Comparison for sorting (higher normalized score is better)
+        bool operator<(const beam_candidate& other) const {
+            return normalized_score < other.normalized_score;
+        }
     };
     
     std::vector<beam_candidate> beam_candidates;
@@ -2540,16 +2571,24 @@ struct server_context {
         res->oaicompat_model       = slot.params.oaicompat_model;
         res->oaicompat_cmpl_id     = slot.params.oaicompat_cmpl_id;
         
-        // Add beam search results if enabled - only return the best candidate
+        // Add beam search results if enabled - return all candidates
         if (slot.params.beam_width > 1 && !slot.beam_candidates.empty()) {
-            const auto& best_candidate = slot.beam_candidates[0]; // Best candidate is always first (sorted by log probability)
-            res->beam_results.push_back({
-                {"text", best_candidate.generated_text},
-                {"log_probability", best_candidate.log_probability},
-                {"normalized_log_probability", best_candidate.tokens.empty() ? 0.0f :
-                    best_candidate.log_probability / static_cast<float>(best_candidate.tokens.size())},
-                {"tokens", best_candidate.tokens}
-            });
+            for (size_t i = 0; i < slot.beam_candidates.size(); i++) {
+                const auto& candidate = slot.beam_candidates[i];
+                res->beam_results.push_back({
+                    {"rank", i + 1},
+                    {"text", candidate.generated_text},
+                    {"log_probability", candidate.log_probability},
+                    {"normalized_score", candidate.normalized_score},
+                    {"length_normalized_log_probability", candidate.generation_length > 0 ?
+                        candidate.log_probability / static_cast<float>(candidate.generation_length) : 0.0f},
+                    {"generation_length", candidate.generation_length},
+                    {"is_finished", candidate.is_finished},
+                    {"tokens", candidate.tokens}
+                });
+            }
+            
+            SRV_DBG("Beam search: returning %zu beam candidates in final response", slot.beam_candidates.size());
         }
         // populate res.probs_output
         if (slot.params.sampling.n_probs > 0) {
@@ -2978,7 +3017,14 @@ private:
         if (slot.n_decoded == 0) {
             slot.beam_candidates.clear();
             // Start with a single empty candidate with log probability 0
-            slot.beam_candidates.push_back({{}, 0.0f, ""});
+            server_slot::beam_candidate initial_candidate;
+            initial_candidate.tokens = {};
+            initial_candidate.log_probability = 0.0f;
+            initial_candidate.normalized_score = 0.0f;
+            initial_candidate.generated_text = "";
+            initial_candidate.is_finished = false;
+            initial_candidate.generation_length = 0;
+            slot.beam_candidates.push_back(initial_candidate);
         }
 
         std::vector<server_slot::beam_candidate> new_candidates; // Stores candidates for the next step
@@ -2989,53 +3035,107 @@ private:
             return llama_vocab_eos(this->vocab); // Fallback to EOS token
         }
         
-        // Get pre-sampler candidate probabilities for the current token index
-        llama_token_data_array * candidates_probs = common_sampler_get_candidate_probs(slot.smpl, this->ctx, tok_idx);
+        // Use optimized sampling function if available, otherwise fall back to standard method
+        llama_token_data_array * candidates_probs = nullptr;
+        try {
+            candidates_probs = common_sampler_get_candidate_probs_fast(slot.smpl, this->ctx, tok_idx);
+        } catch (...) {
+            // Fall back to standard method if optimized version fails
+            candidates_probs = common_sampler_get_candidate_probs(slot.smpl, this->ctx, tok_idx);
+        }
 
         if (!candidates_probs || candidates_probs->size == 0) {
-            SLT_ERR(slot, "common_sampler_get_candidate_probs returned null or empty during beam search!%s", "");
+            SLT_ERR(slot, "Failed to get candidate probabilities during beam search!%s", "");
             id = llama_vocab_eos(this->vocab); // Fallback
             slot.beam_candidates.clear();      // Signal an error state by clearing candidates
         } else {
-            // Determine how many top-k candidates to consider for expansion (e.g., 2 * beam_width)
+            // Determine how many top-k candidates to consider for expansion
             const size_t top_k_expansion = std::min((size_t)(slot.params.beam_width * 2), candidates_probs->size);
 
             // Expand each current beam by the top_k_expansion candidate tokens
             for (const auto& current_beam : slot.beam_candidates) {
+                // Skip finished beams unless we're doing early stopping
+                if (current_beam.is_finished && slot.params.beam_early_stopping) {
+                    new_candidates.push_back(current_beam);
+                    continue;
+                }
+
                 for (size_t k_idx = 0; k_idx < top_k_expansion; k_idx++) {
                     server_slot::beam_candidate new_beam_candidate = current_beam; // Copy current beam
                     llama_token new_token_id = candidates_probs->data[k_idx].id;
-                    float token_prob = candidates_probs->data[k_idx].p; 
-                    float token_log_prob = (token_prob > 0.0f) ? logf(token_prob) : -INFINITY; // Convert probability to log_probability
+                    float token_prob = candidates_probs->data[k_idx].p;
+                    float token_log_prob = (token_prob > 0.0f) ? logf(token_prob) : -INFINITY;
 
                     // Update the new candidate
                     new_beam_candidate.tokens.push_back(new_token_id);
                     new_beam_candidate.log_probability += token_log_prob;
+                    new_beam_candidate.generation_length++;
+                    
+                    // Check if this token indicates completion
+                    bool is_eos = llama_vocab_is_eog(vocab, new_token_id);
+                    new_beam_candidate.is_finished = is_eos;
+                    
+                    // Update generated text
                     new_beam_candidate.generated_text += common_token_to_piece(
                         this->ctx, new_token_id, accept_special_token_fn(slot, new_token_id)
                     );
+                    
+                    // Update normalized score with length penalty
+                    new_beam_candidate.update_normalized_score(slot.params.beam_length_penalty);
+                    
                     new_candidates.push_back(new_beam_candidate);
                 }
             }
 
-            // Sort all expanded candidates by their log probability in descending order
+            // Apply diversity penalty if enabled
+            if (slot.params.beam_diversity_penalty > 0.0f) {
+                for (size_t i = 0; i < new_candidates.size(); i++) {
+                    for (size_t j = i + 1; j < new_candidates.size(); j++) {
+                        // Simple diversity penalty based on text similarity
+                        if (new_candidates[i].generated_text == new_candidates[j].generated_text) {
+                            new_candidates[j].normalized_score -= slot.params.beam_diversity_penalty;
+                        }
+                    }
+                }
+            }
+
+            // Sort candidates by normalized score (higher is better)
             std::sort(new_candidates.begin(), new_candidates.end(),
                 [](const server_slot::beam_candidate& a, const server_slot::beam_candidate& b) {
                     // Handle NaN and -Infinity cases for robust sorting
-                    if (std::isnan(a.log_probability) || std::isnan(b.log_probability)) return false;
-                    if (std::isinf(a.log_probability) && a.log_probability < 0) return false; // a is -inf, b is not (or also -inf)
-                    if (std::isinf(b.log_probability) && b.log_probability < 0) return true;  // b is -inf, a is not
-                    return a.log_probability > b.log_probability; // Higher log_prob is better
+                    if (std::isnan(a.normalized_score) || std::isnan(b.normalized_score)) return false;
+                    if (std::isinf(a.normalized_score) && a.normalized_score < 0) return false;
+                    if (std::isinf(b.normalized_score) && b.normalized_score < 0) return true;
+                    return a.normalized_score > b.normalized_score; // Higher normalized score is better
                 });
+
+            // Early stopping: if we have enough finished candidates, we can stop
+            if (slot.params.beam_early_stopping) {
+                size_t finished_count = 0;
+                for (const auto& candidate : new_candidates) {
+                    if (candidate.is_finished) finished_count++;
+                }
+                
+                if (finished_count >= (size_t)slot.params.beam_width) {
+                    SRV_DBG("Beam search: early stopping with %zu finished candidates", finished_count);
+                    // Keep only finished candidates
+                    new_candidates.erase(
+                        std::remove_if(new_candidates.begin(), new_candidates.end(),
+                            [](const server_slot::beam_candidate& c) { return !c.is_finished; }),
+                        new_candidates.end()
+                    );
+                }
+            }
 
             // Prune the candidates to keep only the top beam_width
             if (new_candidates.size() > (size_t)slot.params.beam_width) {
                 new_candidates.resize(slot.params.beam_width);
             }
 
-            SRV_DBG("Beam search: selected %zu best candidates out of %zu expanded candidates",
-                  std::min(new_candidates.size(), (size_t)slot.params.beam_width),
-                  new_candidates.size()); // Log actual size before potential resize if fewer than beam_width
+            SRV_DBG("Beam search: selected %zu best candidates (finished: %zu)",
+                  new_candidates.size(),
+                  std::count_if(new_candidates.begin(), new_candidates.end(),
+                      [](const server_slot::beam_candidate& c) { return c.is_finished; }));
             
             slot.beam_candidates = std::move(new_candidates); // Update the slot's beam candidates
 
@@ -3045,8 +3145,8 @@ private:
                  id = llama_vocab_eos(this->vocab); // Fallback
             } else {
                 id = slot.beam_candidates[0].tokens.back();
-                SRV_DBG("Beam search: selected best token %d ('%s') with log_prob %.6f",
-                      id, common_token_to_piece(this->ctx, id).c_str(), slot.beam_candidates[0].log_probability);
+                SRV_DBG("Beam search: selected best token %d ('%s') with normalized_score %.6f",
+                      id, common_token_to_piece(this->ctx, id).c_str(), slot.beam_candidates[0].normalized_score);
             }
         }
         return id; // Return the chosen token ID for this step

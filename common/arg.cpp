@@ -1447,6 +1447,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BEAMS"));
     add_opt(common_arg(
+        {"--beam-length-penalty"}, "N",
+        string_format("length normalization penalty for beam search (default: %.1f, 1.0 = no penalty)", (double)params.beam_length_penalty),
+        [](common_params & params, const std::string & value) {
+            params.beam_length_penalty = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_BEAM_LENGTH_PENALTY"));
+    add_opt(common_arg(
+        {"--beam-diversity-penalty"}, "N",
+        string_format("diversity penalty for beam search (default: %.1f, 0.0 = no penalty)", (double)params.beam_diversity_penalty),
+        [](common_params & params, const std::string & value) {
+            params.beam_diversity_penalty = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_BEAM_DIVERSITY_PENALTY"));
+    add_opt(common_arg(
+        {"--no-beam-early-stopping"},
+        string_format("disable early stopping in beam search (default: %s)", params.beam_early_stopping ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.beam_early_stopping = false;
+        }
+    ).set_env("LLAMA_ARG_NO_BEAM_EARLY_STOPPING"));
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

@@ -118,6 +118,12 @@ enum common_grammar_trigger_type {
     COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL,
 };
 
+enum server_mcts_override_mode {
+    MCTS_OVERRIDE_REQUEST,  // Honor the 'use_mcts' from the request
+    MCTS_OVERRIDE_FORCE_ON, // Always use MCTS, ignore request's 'use_mcts'
+    MCTS_OVERRIDE_FORCE_OFF, // Never use MCTS, ignore request's 'use_mcts'
+};
+
 struct common_grammar_trigger {
     common_grammar_trigger_type type;
     std::string value;
@@ -425,6 +431,8 @@ struct common_params {
     std::string cvector_negative_file = "tools/cvector-generator/negative.txt";
 
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
+
+    server_mcts_override_mode mcts_override = MCTS_OVERRIDE_REQUEST; // Server-level MCTS override
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;

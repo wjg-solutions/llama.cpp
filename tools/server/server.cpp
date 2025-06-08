@@ -10,6 +10,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mcts/mcts.h"
 
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
@@ -112,6 +113,11 @@ struct slot_params {
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
+    // MCTS params
+    bool use_mcts = false;
+    int mcts_iterations = 100; // Default number of MCTS iterations
+    double mcts_exploration_constant = 1.414; // Default exploration constant (sqrt(2))
+
     // OAI-compat fields
     bool                         verbose                   = false;
     oaicompat_type               oaicompat                 = OAICOMPAT_TYPE_NONE;
@@ -186,6 +192,9 @@ struct slot_params {
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"lora",                      lora},
+            {"use_mcts",                  use_mcts},
+            {"mcts_iterations",           mcts_iterations},
+            {"mcts_exploration_constant", mcts_exploration_constant},
         };
     }
 };
@@ -282,6 +291,11 @@ struct server_task {
         params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
         params.speculative.n_min = std::max(params.speculative.n_min, 0);
         params.speculative.n_max = std::max(params.speculative.n_max, 0);
+
+        // MCTS params
+        params.use_mcts                    = json_value(data, "use_mcts",                    defaults.use_mcts);
+        params.mcts_iterations             = json_value(data, "mcts_iterations",             defaults.mcts_iterations);
+        params.mcts_exploration_constant = json_value(data, "mcts_exploration_constant", defaults.mcts_exploration_constant);
 
         // Use OpenAI API logprobs only if n_probs wasn't provided
         if (data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs){
@@ -1282,6 +1296,7 @@ struct server_slot {
     json json_schema;
 
     struct common_sampler * smpl = nullptr;
+    std::unique_ptr<mcts::MCTS> mcts_instance; // MCTS instance for this slot
 
     llama_token sampled;
 
@@ -2205,6 +2220,17 @@ struct server_context {
                 send_error(task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
+        }
+
+        // Initialize MCTS if enabled
+        if (slot.params.use_mcts) {
+            // Pass the necessary llama context, model, vocab, and the slot's sampler to MCTS
+            slot.mcts_instance = std::make_unique<mcts::MCTS>(
+                slot.ctx, model, vocab, slot.smpl, slot.params.mcts_exploration_constant
+            );
+            SLT_INF(slot, "MCTS enabled with %d iterations, exploration: %f\n", slot.params.mcts_iterations, slot.params.mcts_exploration_constant);
+        } else {
+            slot.mcts_instance.reset(); // Ensure it's null if not used
         }
 
         if (slot.ctx_dft) {
@@ -3473,8 +3499,52 @@ struct server_context {
                 }
 
                 const int tok_idx = slot.i_batch - i;
+                llama_token id;
 
-                llama_token id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                if (slot.params.use_mcts && slot.mcts_instance) {
+                    SLT_DBG(slot, "%s", "Using MCTS for token generation.\n");
+                    // TODO: This is a placeholder for actual MCTS integration.
+                    // 1. Create GameState from current slot.state
+                    // Use slot.cache_tokens as it represents the full history for the KV cache.
+                    // llama_token is int32_t, MCTS GameState uses std::vector<int>
+                    std::vector<int> current_tokens_for_mcts;
+                    const auto& cached_tokens_vec = slot.cache_tokens.get_text_tokens(); // Assuming this returns const llama_tokens&
+                    current_tokens_for_mcts.reserve(cached_tokens_vec.size());
+                    for(llama_token t : cached_tokens_vec) {
+                        current_tokens_for_mcts.push_back(static_cast<int>(t));
+                    }
+                    // Add the most recently sampled token if it's part of the sequence leading to the current decision point
+                    if (slot.n_decoded > 0) { // Ensure sampled is valid from a previous step if applicable
+                         // If 'sampled' is the token that *just* got us to this state for *next* token prediction,
+                         // it should already be in cache_tokens. If MCTS is to decide the *next* token *after* 'sampled',
+                         // then 'sampled' is part of the current_mcts_state.
+                         // The logic here depends on whether MCTS is replacing the *current* sampling decision or the *next* one.
+                         // Assuming MCTS decides the token *after* the sequence in cache_tokens.
+                    }
+
+                    mcts::GameState current_mcts_state(current_tokens_for_mcts);
+                    // is_terminal and reward will be determined by MCTS simulation or game rules.
+
+                    std::shared_ptr<mcts::MCTSNode> root_node = std::make_shared<mcts::MCTSNode>(
+                        current_mcts_state,
+                        slot.ctx, // llama_context
+                        model,    // llama_model from server_context
+                        vocab,    // llama_vocab from server_context
+                        slot.smpl // common_sampler for this slot
+                    );
+                    
+                    id = slot.mcts_instance->get_best_action(root_node, slot.params.mcts_iterations);
+
+                    // Fallback if MCTS fails to provide a token (e.g. -1 or invalid token)
+                    if (id < 0 || id >= llama_vocab_n_tokens(vocab)) {
+                        SLT_WRN(slot, "%s", "MCTS failed to return a valid token, falling back to default sampler.\n");
+                        id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                    } else {
+                        SLT_DBG(slot, "MCTS selected token: %d\n", id);
+                    }
+                } else {
+                    id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                }
 
                 slot.i_batch = -1;
 

@@ -2830,6 +2830,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
+        {"--mcts-force-on"},
+        "force MCTS (Monte Carlo Tree Search) for all completion requests, ignoring per-request 'use_mcts' setting",
+        [](common_params & params) {
+            params.mcts_override = MCTS_OVERRIDE_FORCE_ON;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--mcts-force-off"},
+        "disable MCTS (Monte Carlo Tree Search) for all completion requests, ignoring per-request 'use_mcts' setting",
+        [](common_params & params) {
+            params.mcts_override = MCTS_OVERRIDE_FORCE_OFF;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--props"},
         string_format("enable changing global properties via POST /props (default: %s)", params.endpoint_props ? "enabled" : "disabled"),
         [](common_params & params) {

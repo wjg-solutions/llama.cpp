@@ -169,6 +169,7 @@ endif()
 #
 
 add_subdirectory(src)
+add_subdirectory(mcts)
 
 #
 # utils, programs, examples and tests

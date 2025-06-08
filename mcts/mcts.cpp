@@ -112,22 +112,22 @@ bool MCTSNode::is_terminal_node() const {
 }
 
 std::shared_ptr<MCTSNode> MCTSNode::uct_select_child(double exploration_constant) const {
+    std::lock_guard<std::mutex> lock(node_mutex);
     if (children.empty()) return nullptr;
 
     std::shared_ptr<MCTSNode> best_child = nullptr;
     double best_uct_value = -std::numeric_limits<double>::infinity();
-    int unvisited_children_count = 0;
-    for(const auto& child : children) if(child->n_visits == 0) unvisited_children_count++;
 
     for (const auto& child : children) {
-        if (child->n_visits == 0) { // Prefer unvisited children
-             // If multiple unvisited, UCT is effectively infinite.
-             // A common strategy is to pick randomly among unvisited, or just the first.
-             // Here, we'll pick the first unvisited one encountered.
+        int child_visits = child->n_visits.load();
+        if (child_visits == 0) { // Prefer unvisited children
             return child;
         }
-        double uct_value = (child->q_value / child->n_visits) +
-                           exploration_constant * std::sqrt(std::log(static_cast<double>(this->n_visits)) / child->n_visits);
+        double child_q = child->q_value.load();
+        int parent_visits = this->n_visits.load();
+        
+        double uct_value = (child_q / child_visits) +
+                           exploration_constant * std::sqrt(std::log(static_cast<double>(parent_visits)) / child_visits);
         if (uct_value > best_uct_value) {
             best_uct_value = uct_value;
             best_child = child;
@@ -137,6 +137,7 @@ std::shared_ptr<MCTSNode> MCTSNode::uct_select_child(double exploration_constant
 }
 
 std::shared_ptr<MCTSNode> MCTSNode::expand() {
+    std::lock_guard<std::mutex> lock(node_mutex);
     if (untried_actions.empty() || is_terminal_node()) {
         return nullptr;
     }
@@ -154,15 +155,18 @@ std::shared_ptr<MCTSNode> MCTSNode::expand() {
         new_game_state.reward = 0.0f; // Example: neutral for max length
     }
 
-
     auto new_node = std::make_shared<MCTSNode>(new_game_state, l_ctx, l_model, l_vocab, l_sampler, shared_from_this());
     children.push_back(new_node);
     return new_node;
 }
 
 void MCTSNode::backpropagate(double reward_value) {
-    n_visits++;
-    q_value += reward_value;
+    n_visits.fetch_add(1);
+    // Use atomic operations for thread-safe updates
+    double current_q = q_value.load();
+    while (!q_value.compare_exchange_weak(current_q, current_q + reward_value)) {
+        // Retry if another thread modified q_value
+    }
     if (parent) {
         parent->backpropagate(reward_value);
     }
@@ -254,6 +258,39 @@ GameState MCTS::simulate_playout(std::shared_ptr<MCTSNode> node) {
     return current_playout_state;
 }
 
+double MCTS::simulate_lightweight(std::shared_ptr<MCTSNode> node) {
+    // Fast heuristic-based simulation without actual token generation
+    // This avoids expensive llama_decode calls and context state management
+    
+    const GameState& state = node->state;
+    
+    // Simple heuristic scoring based on sequence characteristics
+    double score = 0.0;
+    
+    // Length bonus/penalty
+    size_t seq_len = state.tokens_sequence.size();
+    if (seq_len < 3) {
+        score -= 1.0; // Penalty for very short sequences
+    } else if (seq_len > 50) {
+        score -= 0.5; // Penalty for very long sequences
+    } else {
+        score += 0.1 * seq_len; // Small bonus for reasonable length
+    }
+    
+    // Check if sequence ends with EOS token
+    if (!state.tokens_sequence.empty() &&
+        state.tokens_sequence.back() == llama_vocab_eos(l_vocab_)) {
+        score += 2.0; // Big bonus for proper termination
+    }
+    
+    // Add some randomness to avoid deterministic behavior
+    std::uniform_real_distribution<double> dist(-0.5, 0.5);
+    score += dist(random_engine_);
+    
+    // Normalize score to [-1, 1] range
+    return std::tanh(score);
+}
+
 void MCTS::backpropagate_rewards(std::shared_ptr<MCTSNode> node, double reward_value) {
     node->backpropagate(reward_value);
 }
@@ -270,8 +307,38 @@ void MCTS::run_iteration(std::shared_ptr<MCTSNode> root_node) {
         }
     }
     
-    GameState playout_result_state = simulate_playout(expanded_node);
-    backpropagate_rewards(expanded_node, playout_result_state.reward);
+    // Use lightweight simulation for much faster execution
+    double reward = simulate_lightweight(expanded_node);
+    backpropagate_rewards(expanded_node, reward);
+}
+
+void MCTS::run_parallel_iterations(std::shared_ptr<MCTSNode> root_node, int num_iterations, int num_threads) {
+    // Determine optimal number of threads (don't exceed hardware concurrency or requested threads)
+    const int max_threads = std::min({num_iterations, num_threads, static_cast<int>(std::thread::hardware_concurrency())});
+    const int iterations_per_thread = num_iterations / max_threads;
+    const int remaining_iterations = num_iterations % max_threads;
+    
+    std::vector<std::thread> threads;
+    threads.reserve(max_threads);
+    
+    // Launch worker threads
+    for (int t = 0; t < max_threads; ++t) {
+        int thread_iterations = iterations_per_thread;
+        if (t < remaining_iterations) {
+            thread_iterations++; // Distribute remaining iterations
+        }
+        
+        threads.emplace_back([this, root_node, thread_iterations]() {
+            for (int i = 0; i < thread_iterations; ++i) {
+                run_iteration(root_node);
+            }
+        });
+    }
+    
+    // Wait for all threads to complete
+    for (auto& thread : threads) {
+        thread.join();
+    }
 }
 
 int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iterations) {
@@ -297,13 +364,10 @@ int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iteration
     // We'll work with a cloned sampler instead
 
 
-    std::cout << "[MCTS] Starting " << num_iterations << " MCTS iterations" << std::endl;
-    for (int i = 0; i < num_iterations; ++i) {
-        run_iteration(root_node);
-        if (i % 10 == 0 || i < 5) {
-            std::cout << "[MCTS] Completed iteration " << (i + 1) << "/" << num_iterations << std::endl;
-        }
-    }
+    std::cout << "[MCTS] Starting " << num_iterations << " MCTS iterations in parallel" << std::endl;
+    // Use hardware concurrency as default thread count
+    int num_threads = std::thread::hardware_concurrency();
+    run_parallel_iterations(root_node, num_iterations, num_threads);
     std::cout << "[MCTS] Completed all " << num_iterations << " iterations" << std::endl;
 
     // Restore sampler state
@@ -328,8 +392,9 @@ int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iteration
     int max_visits = -1;
 
     for (const auto& child : root_node->children) {
-        if (child->n_visits > max_visits) {
-            max_visits = child->n_visits;
+        int child_visits = child->n_visits.load();
+        if (child_visits > max_visits) {
+            max_visits = child_visits;
             best_child = child;
         }
     }
@@ -339,7 +404,7 @@ int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iteration
         return -1;
     }
 
-    std::cout << "[MCTS] Best child found with " << best_child->n_visits << " visits, q_value: " << best_child->q_value << std::endl;
+    std::cout << "[MCTS] Best child found with " << best_child->n_visits.load() << " visits, q_value: " << best_child->q_value.load() << std::endl;
     std::cout << "[MCTS] Root state size: " << root_node->state.tokens_sequence.size()
               << ", Best child state size: " << best_child->state.tokens_sequence.size() << std::endl;
 

@@ -8,6 +8,10 @@
 #include <limits>
 #include <random>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <future>
 
 #include "../include/llama.h"
 #include "../common/common.h"
@@ -38,8 +42,9 @@ public:
     std::vector<int> untried_actions;
     std::vector<std::shared_ptr<MCTSNode>> children;
 
-    double q_value = 0.0;
-    int n_visits = 0;
+    std::atomic<double> q_value{0.0};
+    std::atomic<int> n_visits{0};
+    mutable std::mutex node_mutex; // For thread-safe operations on children and untried_actions
 
     // Pointers to llama context for node operations (expansion, simulation trigger)
     struct llama_context* l_ctx;
@@ -67,12 +72,14 @@ public:
          double exploration_constant = 1.414);
 
     void run_iteration(std::shared_ptr<MCTSNode> root_node);
+    void run_parallel_iterations(std::shared_ptr<MCTSNode> root_node, int num_iterations, int num_threads);
     int get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iterations); // Returns action (token ID)
 
 private:
     std::shared_ptr<MCTSNode> select_promising_node(std::shared_ptr<MCTSNode> root_node);
     // expand_node is now part of MCTSNode::expand
     GameState simulate_playout(std::shared_ptr<MCTSNode> node); // Renamed, more descriptive
+    double simulate_lightweight(std::shared_ptr<MCTSNode> node); // Fast heuristic-based simulation
     void backpropagate_rewards(std::shared_ptr<MCTSNode> node, double reward_value);
 
     struct llama_context* l_ctx_;
@@ -82,6 +89,7 @@ private:
 
     double exploration_constant_;
     std::mt19937 random_engine_;
+    mutable std::mutex mcts_mutex_; // For thread-safe operations
 };
 
 } // namespace mcts

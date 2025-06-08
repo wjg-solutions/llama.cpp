@@ -9,7 +9,7 @@
 #include <random>
 #include <cmath>
 #include <limits>
-#include <iostream> // For debugging, can be removed later
+#include <iostream> // For debugging and logging
 #include <cstdint>  // For uint8_t
 
 namespace mcts {
@@ -37,6 +37,7 @@ MCTSNode::MCTSNode(GameState s,
 void MCTSNode::populate_untried_actions() {
     untried_actions.clear();
     if (!l_ctx || !l_model || !l_vocab || state.is_terminal_state(l_vocab, llama_n_ctx(l_ctx))) {
+        std::cout << "[MCTS] populate_untried_actions: Terminal state or invalid context" << std::endl;
         return;
     }
 
@@ -83,33 +84,64 @@ void MCTSNode::populate_untried_actions() {
         return;
     }
 
-    int n_vocab = llama_vocab_n_tokens(l_vocab);
-    std::vector<llama_token_data> candidates_data;
-    candidates_data.reserve(n_vocab);
-    for (int token_id = 0; token_id < n_vocab; ++token_id) {
-        candidates_data.push_back({static_cast<llama_token>(token_id), logits[token_id], 0.0f});
+    // Use the sampler to get properly processed candidates
+    // This applies temperature, top-p, top-k, and other sampling parameters
+    const auto * candidates = common_sampler_get_candidates(l_sampler);
+    if (!candidates || candidates->size == 0) {
+        std::cout << "[MCTS] populate_untried_actions: No candidates from sampler" << std::endl;
+        return;
     }
 
-    llama_token_data_array candidates_arr = {candidates_data.data(), candidates_data.size(), false};
+    // Use the sampler to get properly processed candidates
+    // Create a temporary sampler context for this specific position
+    struct common_sampler * temp_sampler = common_sampler_clone(l_sampler);
     
-    // Apply sampling parameters from the slot's sampler
-    if (l_sampler) { // l_sampler is now guaranteed by constructor
-        // Get candidates from the sampler - note: common_sampler_apply_params doesn't exist
-        // We'll work with the raw logits and apply basic filtering
+    // Accept all tokens in the current sequence to set up the sampler state
+    for (int token : state.tokens_sequence) {
+        common_sampler_accept(temp_sampler, static_cast<llama_token>(token), false);
+    }
+    
+    // Sample a token to trigger the sampling pipeline and get candidates
+    // This will populate the internal candidates array with properly processed probabilities
+    llama_token sample_token = common_sampler_sample(temp_sampler, l_ctx, batch.n_tokens - 1);
+    const auto * processed_candidates = common_sampler_get_candidates(temp_sampler);
+    
+    if (!processed_candidates || processed_candidates->size == 0) {
+        common_sampler_free(temp_sampler);
+        std::cout << "[MCTS] populate_untried_actions: No processed candidates" << std::endl;
+        return;
     }
 
-
-    // Populate untried_actions from the (potentially filtered and sorted) candidates
-    // common_sampler_apply_params might sort or just filter. We take top N.
-    const int top_n_for_mcts_actions = 10; // How many potential actions to consider for MCTS expansion
-    for (size_t i = 0; i < std::min(candidates_arr.size, static_cast<size_t>(top_n_for_mcts_actions)); ++i) {
-        // Avoid re-adding EOS if the state is already effectively terminal by its content (e.g. already ended with EOS)
-        // However, if EOS is a valid next action and state is not yet EOS-terminated, it should be considered.
-        if (candidates_arr.data[i].id == llama_vocab_eos(l_vocab) && state.tokens_sequence.back() == llama_vocab_eos(l_vocab)) {
+    // Select top candidates for MCTS exploration, avoiding problematic tokens
+    const int top_n_for_mcts_actions = 10;
+    int added_actions = 0;
+    
+    for (size_t i = 0; i < processed_candidates->size && added_actions < top_n_for_mcts_actions; ++i) {
+        llama_token token_id = processed_candidates->data[i].id;
+        
+        // Skip tokens that would cause immediate termination unless they're reasonable
+        // Skip EOS unless we have a reasonable sequence length
+        if (token_id == llama_vocab_eos(l_vocab) && state.tokens_sequence.size() < 5) {
             continue;
         }
-        untried_actions.push_back(candidates_arr.data[i].id);
+        
+        // Skip very low probability tokens (less than 1% of max probability)
+        if (i > 0 && processed_candidates->data[i].p < processed_candidates->data[0].p * 0.01f) {
+            break;
+        }
+        
+        // Skip special tokens that might cause issues (BOS, padding, etc.)
+        if (token_id == llama_vocab_bos(l_vocab) || token_id == llama_vocab_pad(l_vocab)) {
+            continue;
+        }
+        
+        untried_actions.push_back(token_id);
+        added_actions++;
     }
+    
+    common_sampler_free(temp_sampler);
+    
+    std::cout << "[MCTS] populate_untried_actions: Added " << untried_actions.size() << " potential actions" << std::endl;
     
     std::random_device rd_shuffle;
     std::mt19937 g_shuffle(rd_shuffle());
@@ -187,6 +219,7 @@ MCTS::MCTS(struct llama_context* ctx, struct llama_model* model, const struct ll
     : l_ctx_(ctx), l_model_(model), l_vocab_(vocab), l_sampler_(sampler), exploration_constant_(ec) {
     std::random_device rd;
     random_engine_ = std::mt19937(rd());
+    std::cout << "[MCTS] MCTS instance created with exploration constant: " << ec << std::endl;
 }
 
 std::shared_ptr<MCTSNode> MCTS::select_promising_node(std::shared_ptr<MCTSNode> root_node) {
@@ -229,12 +262,13 @@ GameState MCTS::simulate_playout(std::shared_ptr<MCTSNode> node) {
         
         // Decode only the last token of the current simulation sequence to get logits for the next.
         // The KV cache is advanced by this decode.
-        common_batch_add(batch_sim, current_playout_state.tokens_sequence.back(), sim_n_past -1 , {0}, true);
+        common_batch_add(batch_sim, current_playout_state.tokens_sequence.back(), sim_n_past - 1, {0}, true);
 
         if (llama_decode(l_ctx_, batch_sim) != 0) {
             current_playout_state.is_terminal = true; current_playout_state.reward = -2.0f; break;
         }
 
+        // Sample the next token using the proper sampling pipeline
         llama_token next_token = common_sampler_sample(sim_sampler, l_ctx_, 0);
         common_sampler_accept(sim_sampler, next_token, true);
 
@@ -286,8 +320,12 @@ void MCTS::run_iteration(std::shared_ptr<MCTSNode> root_node) {
 }
 
 int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iterations) {
+    std::cout << "[MCTS] get_best_action called with " << num_iterations << " iterations" << std::endl;
+    
     if (!root_node || !l_ctx_ || !l_sampler_) {
-        //fprintf(stderr, "MCTS::get_best_action: Invalid MCTS setup (context or sampler missing).\n");
+        std::cout << "[MCTS] ERROR: Invalid MCTS setup - root_node: " << (root_node ? "valid" : "null")
+                  << ", l_ctx_: " << (l_ctx_ ? "valid" : "null")
+                  << ", l_sampler_: " << (l_sampler_ ? "valid" : "null") << std::endl;
         return -1;
     }
 
@@ -304,9 +342,14 @@ int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iteration
     // We'll work with a cloned sampler instead
 
 
+    std::cout << "[MCTS] Starting " << num_iterations << " MCTS iterations" << std::endl;
     for (int i = 0; i < num_iterations; ++i) {
         run_iteration(root_node);
+        if (i % 10 == 0 || i < 5) {
+            std::cout << "[MCTS] Completed iteration " << (i + 1) << "/" << num_iterations << std::endl;
+        }
     }
+    std::cout << "[MCTS] Completed all " << num_iterations << " iterations" << std::endl;
 
     // Restore sampler state
     // Remove this line since sampler_state_size is not defined
@@ -322,7 +365,7 @@ int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iteration
 
 
     if (root_node->children.empty()) {
-        //fprintf(stderr, "MCTS::get_best_action: Root node has no children after iterations.\n");
+        std::cout << "[MCTS] ERROR: Root node has no children after " << num_iterations << " iterations" << std::endl;
         return -1;
     }
     
@@ -337,15 +380,21 @@ int MCTS::get_best_action(std::shared_ptr<MCTSNode> root_node, int num_iteration
     }
     
     if (!best_child) {
-        //fprintf(stderr, "MCTS::get_best_action: Could not determine best child.\n");
-        return -1; 
+        std::cout << "[MCTS] ERROR: Could not determine best child" << std::endl;
+        return -1;
     }
+
+    std::cout << "[MCTS] Best child found with " << best_child->n_visits << " visits, q_value: " << best_child->q_value << std::endl;
+    std::cout << "[MCTS] Root state size: " << root_node->state.tokens_sequence.size()
+              << ", Best child state size: " << best_child->state.tokens_sequence.size() << std::endl;
 
     if (best_child->state.tokens_sequence.size() > root_node->state.tokens_sequence.size()) {
-        return best_child->state.tokens_sequence[root_node->state.tokens_sequence.size()];
+        int selected_token = best_child->state.tokens_sequence[root_node->state.tokens_sequence.size()];
+        std::cout << "[MCTS] Selected token: " << selected_token << std::endl;
+        return selected_token;
     }
 
-    //fprintf(stderr, "MCTS::get_best_action: Best child's state not longer than root's.\n");
+    std::cout << "[MCTS] ERROR: Best child's state not longer than root's" << std::endl;
     return -1;
 }
 

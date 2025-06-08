@@ -115,7 +115,7 @@ struct slot_params {
 
     // MCTS params
     bool use_mcts = false;
-    int mcts_iterations = 100; // Default number of MCTS iterations
+    int mcts_iterations = 10; // Default number of MCTS iterations
     double mcts_exploration_constant = 1.414; // Default exploration constant (sqrt(2))
 
     // OAI-compat fields
@@ -296,6 +296,26 @@ struct server_task {
         params.use_mcts                    = json_value(data, "use_mcts",                    defaults.use_mcts);
         params.mcts_iterations             = json_value(data, "mcts_iterations",             defaults.mcts_iterations);
         params.mcts_exploration_constant = json_value(data, "mcts_exploration_constant", defaults.mcts_exploration_constant);
+        
+        printf("[SERVER] MCTS params from request: use_mcts=%s, iterations=%d, exploration=%f\n",
+               params.use_mcts ? "true" : "false", params.mcts_iterations, params.mcts_exploration_constant);
+
+        // Apply server-level MCTS override
+        bool original_use_mcts = params.use_mcts;
+        switch (params_base.mcts_override) {
+            case MCTS_OVERRIDE_FORCE_ON:
+                params.use_mcts = true;
+                printf("[SERVER] MCTS override: FORCE_ON - enabling MCTS (was %s)\n", original_use_mcts ? "true" : "false");
+                break;
+            case MCTS_OVERRIDE_FORCE_OFF:
+                params.use_mcts = false;
+                printf("[SERVER] MCTS override: FORCE_OFF - disabling MCTS (was %s)\n", original_use_mcts ? "true" : "false");
+                break;
+            case MCTS_OVERRIDE_REQUEST:
+            default:
+                printf("[SERVER] MCTS override: REQUEST - honoring request setting (%s)\n", params.use_mcts ? "true" : "false");
+                break;
+        }
 
         // Use OpenAI API logprobs only if n_probs wasn't provided
         if (data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs){
@@ -2229,8 +2249,11 @@ struct server_context {
                 slot.ctx, model, vocab, slot.smpl, slot.params.mcts_exploration_constant
             );
             SLT_INF(slot, "MCTS enabled with %d iterations, exploration: %f\n", slot.params.mcts_iterations, slot.params.mcts_exploration_constant);
+            printf("[SERVER] MCTS initialized for slot %d with %d iterations, exploration: %f\n",
+                   slot.id, slot.params.mcts_iterations, slot.params.mcts_exploration_constant);
         } else {
             slot.mcts_instance.reset(); // Ensure it's null if not used
+            printf("[SERVER] MCTS disabled for slot %d\n", slot.id);
         }
 
         if (slot.ctx_dft) {
@@ -3502,9 +3525,10 @@ struct server_context {
                 llama_token id;
 
                 if (slot.params.use_mcts && slot.mcts_instance) {
+                    printf("[SERVER] Using MCTS for token generation in slot %d\n", slot.id);
                     SLT_DBG(slot, "%s", "Using MCTS for token generation.\n");
-                    // TODO: This is a placeholder for actual MCTS integration.
-                    // 1. Create GameState from current slot.state
+                    
+                    // Create GameState from current slot.state
                     // Use slot.cache_tokens as it represents the full history for the KV cache.
                     // llama_token is int32_t, MCTS GameState uses std::vector<int>
                     std::vector<int> current_tokens_for_mcts;
@@ -3513,17 +3537,10 @@ struct server_context {
                     for(llama_token t : cached_tokens_vec) {
                         current_tokens_for_mcts.push_back(static_cast<int>(t));
                     }
-                    // Add the most recently sampled token if it's part of the sequence leading to the current decision point
-                    if (slot.n_decoded > 0) { // Ensure sampled is valid from a previous step if applicable
-                         // If 'sampled' is the token that *just* got us to this state for *next* token prediction,
-                         // it should already be in cache_tokens. If MCTS is to decide the *next* token *after* 'sampled',
-                         // then 'sampled' is part of the current_mcts_state.
-                         // The logic here depends on whether MCTS is replacing the *current* sampling decision or the *next* one.
-                         // Assuming MCTS decides the token *after* the sequence in cache_tokens.
-                    }
+                    
+                    printf("[SERVER] MCTS state has %zu tokens\n", current_tokens_for_mcts.size());
 
                     mcts::GameState current_mcts_state(current_tokens_for_mcts);
-                    // is_terminal and reward will be determined by MCTS simulation or game rules.
 
                     std::shared_ptr<mcts::MCTSNode> root_node = std::make_shared<mcts::MCTSNode>(
                         current_mcts_state,
@@ -3533,17 +3550,23 @@ struct server_context {
                         slot.smpl // common_sampler for this slot
                     );
                     
+                    printf("[SERVER] Calling MCTS get_best_action with %d iterations\n", slot.params.mcts_iterations);
                     id = slot.mcts_instance->get_best_action(root_node, slot.params.mcts_iterations);
 
                     // Fallback if MCTS fails to provide a token (e.g. -1 or invalid token)
                     if (id < 0 || id >= llama_vocab_n_tokens(vocab)) {
+                        printf("[SERVER] MCTS failed to return valid token (got %d), falling back to default sampler\n", id);
                         SLT_WRN(slot, "%s", "MCTS failed to return a valid token, falling back to default sampler.\n");
                         id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                        printf("[SERVER] Default sampler selected token: %d\n", id);
                     } else {
+                        printf("[SERVER] MCTS successfully selected token: %d\n", id);
                         SLT_DBG(slot, "MCTS selected token: %d\n", id);
                     }
                 } else {
+                    printf("[SERVER] Using default sampler for slot %d (MCTS disabled or not available)\n", slot.id);
                     id = common_sampler_sample(slot.smpl, ctx, tok_idx);
+                    printf("[SERVER] Default sampler selected token: %d\n", id);
                 }
 
                 slot.i_batch = -1;

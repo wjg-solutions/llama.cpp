@@ -470,15 +470,11 @@ llama_token_data_array * common_sampler_get_candidate_probs(struct common_sample
         // such as a way to apply a const sampler or a temporary non-state-modifying apply.
         struct llama_sampler * smpl_clone = llama_sampler_clone(smpl_const);
         if (!smpl_clone) {
-             // ERROR HANDLING: If a sampler fails to clone, log the error and continue.
-             // This allows the function to still attempt to apply other samplers in the chain
-             // and return partially processed probabilities rather than failing entirely.
-             // Depending on the use case, a more stringent error handling (e.g., returning nullptr
-             // or a specific error code) might be considered if a partially processed result
-             // is not acceptable. For now, this provides some resilience.
-             fprintf(stderr, "%s: Failed to clone sampler %d ('%s') in chain. Skipping this sampler.\n",
+             // CRITICAL ERROR: Sampler cloning failure indicates a serious issue
+             // For beam search, we need reliable probability estimates, so fail fast
+             fprintf(stderr, "%s: CRITICAL: Failed to clone sampler %d ('%s') in chain. This indicates a serious issue.\n",
                  __func__, i, sampler_name ? sampler_name : "unknown");
-             continue;
+             return nullptr;
         }
         llama_sampler_apply(smpl_clone, &cur_p);
         // Free the cloned individual sampler immediately after use

@@ -115,7 +115,7 @@ struct slot_params {
 
     // MCTS params
     bool use_mcts = false;
-    int mcts_iterations = 10; // Default number of MCTS iterations
+    int mcts_iterations = 3; // Default number of MCTS iterations (will be overridden by server params)
     double mcts_exploration_constant = 1.414; // Default exploration constant (sqrt(2))
 
     // OAI-compat fields
@@ -242,6 +242,7 @@ struct server_task {
         slot_params defaults;
         defaults.sampling    = params_base.sampling;
         defaults.speculative = params_base.speculative;
+        defaults.mcts_iterations = params_base.mcts_iterations;
 
         // enabling this will output extra debug information in the HTTP responses from the server
         params.verbose           = params_base.verbosity > 9;

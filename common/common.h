@@ -433,6 +433,7 @@ struct common_params {
     bool spm_infill = false; // suffix/prefix/middle pattern for infill
 
     server_mcts_override_mode mcts_override = MCTS_OVERRIDE_REQUEST; // Server-level MCTS override
+    int32_t mcts_iterations = 3; // Default number of MCTS iterations
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;

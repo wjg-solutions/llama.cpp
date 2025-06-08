@@ -41,54 +41,8 @@ void MCTSNode::populate_untried_actions() {
         return;
     }
 
-    // The KV cache of l_ctx should be consistent with this->state.tokens_sequence.
-    // The MCTS::get_best_action method (which calls run_iteration -> select -> expand -> this)
-    // is responsible for managing the overall l_ctx state (save/restore).
-    // This function assumes l_ctx is currently at the state represented by parent node,
-    // and this decode will advance it to current node's state to get next logits.
-
-    llama_batch batch = llama_batch_init(state.tokens_sequence.size() + 1, 0, 1);
-
     if (state.tokens_sequence.empty()) {
-        // If state is empty, we might predict from BOS or an empty prefix.
-        // For now, let's assume initial tokens (like BOS) are handled by the caller setting up the root GameState.
-        // If we need to predict from a truly empty state, llama_decode might need special handling or a BOS token.
-        // For this example, if tokens_sequence is empty, we won't populate actions.
-        // A more robust solution would handle this based on model requirements (e.g., always start with BOS).
-        llama_batch_free(batch);
-        return;
-    }
-
-    // Decode the current node's full sequence to get logits for the next token.
-    // This ensures the KV cache is correctly populated up to this node's state.
-    for (size_t i = 0; i < state.tokens_sequence.size(); ++i) {
-        common_batch_add(batch, state.tokens_sequence[i], i, {0}, (i == state.tokens_sequence.size() - 1));
-    }
-    
-    if (batch.n_tokens == 0) {
-        llama_batch_free(batch);
-        return;
-    }
-
-    if (llama_decode(l_ctx, batch) != 0) {
-        //fprintf(stderr, "MCTSNode::populate_untried_actions: llama_decode failed.\n");
-        llama_batch_free(batch);
-        return;
-    }
-    
-    float* logits = llama_get_logits_ith(l_ctx, batch.n_tokens - 1);
-    llama_batch_free(batch); // Free batch after use
-
-    if (!logits) {
-        //fprintf(stderr, "MCTSNode::populate_untried_actions: llama_get_logits_ith failed.\n");
-        return;
-    }
-
-    // Use the sampler to get properly processed candidates
-    // This applies temperature, top-p, top-k, and other sampling parameters
-    const auto * candidates = common_sampler_get_candidates(l_sampler);
-    if (!candidates || candidates->size == 0) {
-        std::cout << "[MCTS] populate_untried_actions: No candidates from sampler" << std::endl;
+        std::cout << "[MCTS] populate_untried_actions: Empty token sequence" << std::endl;
         return;
     }
 
@@ -103,7 +57,7 @@ void MCTSNode::populate_untried_actions() {
     
     // Sample a token to trigger the sampling pipeline and get candidates
     // This will populate the internal candidates array with properly processed probabilities
-    llama_token sample_token = common_sampler_sample(temp_sampler, l_ctx, batch.n_tokens - 1);
+    llama_token sample_token = common_sampler_sample(temp_sampler, l_ctx, -1);
     const auto * processed_candidates = common_sampler_get_candidates(temp_sampler);
     
     if (!processed_candidates || processed_candidates->size == 0) {
@@ -244,7 +198,8 @@ GameState MCTS::simulate_playout(std::shared_ptr<MCTSNode> node) {
         common_sampler_accept(sim_sampler, static_cast<llama_token>(token), false);
     }
 
-    llama_batch batch_sim = llama_batch_init(llama_n_ctx(l_ctx_), 0, 1); // Max batch size for simulation
+    // Use a smaller batch size to respect limits - single token at a time for simulation
+    llama_batch batch_sim = llama_batch_init(1, 0, 1);
     int sim_n_past = current_playout_state.tokens_sequence.size(); // n_past for the simulation context
 
     // Simulate from the current_playout_state

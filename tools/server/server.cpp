@@ -103,6 +103,7 @@ struct slot_params {
     float   beam_length_penalty   = 1.0f; // length normalization penalty for beam search (1.0 = no penalty)
     float   beam_diversity_penalty = 0.0f; // diversity penalty for beam search (0.0 = no penalty)
     bool    beam_early_stopping   = true; // enable early stopping in beam search
+    bool    beam_deterministic    = true; // enable deterministic beam search (consistent results)
     
     // Memory limits for beam search
     size_t  beam_max_memory_mb    = 512;   // maximum memory usage for beam candidates (MB)
@@ -194,6 +195,7 @@ struct slot_params {
             {"beam_length_penalty",       beam_length_penalty},
             {"beam_diversity_penalty",    beam_diversity_penalty},
             {"beam_early_stopping",       beam_early_stopping},
+            {"beam_deterministic",        beam_deterministic},
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
@@ -271,6 +273,7 @@ struct server_task {
         params.beam_length_penalty = json_value(data, "beam_length_penalty", params_base.beam_length_penalty);
         params.beam_diversity_penalty = json_value(data, "beam_diversity_penalty", params_base.beam_diversity_penalty);
         params.beam_early_stopping = json_value(data, "beam_early_stopping", params_base.beam_early_stopping);
+        params.beam_deterministic = json_value(data, "beam_deterministic", params_base.beam_deterministic);
       //params.t_max_prompt_ms  = json_value(data, "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
         params.t_max_predict_ms = json_value(data, "t_max_predict_ms",   defaults.t_max_predict_ms);
         params.response_fields  = json_value(data, "response_fields",   std::vector<std::string>());
@@ -2522,15 +2525,16 @@ struct server_context {
         res->id      = slot.id_task;
         res->index   = slot.index;
         
-        // For beam search streaming, use the top beam candidate's text
+        // For beam search streaming, use the consensus beam candidate's text
         if (slot.params.beam_width > 1 && !slot.beam_candidates.empty()) {
-            // Send the current best beam candidate's generated text
-            const auto& best_candidate = slot.beam_candidates[0];
-            res->content = best_candidate.generated_text.substr(slot.n_sent_text);
+            // Find the consensus beam for streaming
+            size_t consensus_idx = _beam_search_find_consensus_beam(slot);
+            const auto& consensus_candidate = slot.beam_candidates[consensus_idx];
+            res->content = consensus_candidate.generated_text.substr(slot.n_sent_text);
             res->tokens  = { tkn.tok }; // Still send the current token for compatibility
             
-            SRV_DBG("Beam streaming: sending partial text from best candidate (score: %.6f)",
-                   best_candidate.normalized_score);
+            SRV_DBG("Beam streaming: sending partial text from consensus candidate %zu (score: %.6f)",
+                   consensus_idx, consensus_candidate.normalized_score);
         } else {
             // Standard streaming behavior
             res->content = tkn.text_to_send;
@@ -3021,6 +3025,103 @@ struct server_context {
     }
 
 private:
+    // Find the beam candidate that represents the best consensus/common choice
+    size_t _beam_search_find_consensus_beam(const server_slot &slot) {
+        if (slot.beam_candidates.empty()) {
+            return 0;
+        }
+        
+        if (slot.beam_candidates.size() == 1) {
+            return 0;
+        }
+        
+        // Strategy 1: Find the beam with the highest score that's not an outlier
+        // Calculate mean and standard deviation of scores
+        double score_sum = 0.0;
+        double score_sq_sum = 0.0;
+        size_t valid_count = 0;
+        
+        for (const auto& candidate : slot.beam_candidates) {
+            if (!std::isnan(candidate.normalized_score) && !std::isinf(candidate.normalized_score)) {
+                score_sum += candidate.normalized_score;
+                score_sq_sum += candidate.normalized_score * candidate.normalized_score;
+                valid_count++;
+            }
+        }
+        
+        if (valid_count == 0) {
+            return 0; // Fallback to first candidate
+        }
+        
+        double mean_score = score_sum / valid_count;
+        double variance = (score_sq_sum / valid_count) - (mean_score * mean_score);
+        double std_dev = std::sqrt(std::max(0.0, variance));
+        
+        // Find the highest-scoring candidate that's within 1 standard deviation of the mean
+        // This helps avoid outliers while still preferring good candidates
+        size_t best_consensus_idx = 0;
+        float best_consensus_score = -INFINITY;
+        
+        for (size_t i = 0; i < slot.beam_candidates.size(); i++) {
+            const auto& candidate = slot.beam_candidates[i];
+            
+            // Skip invalid scores
+            if (std::isnan(candidate.normalized_score) || std::isinf(candidate.normalized_score)) {
+                continue;
+            }
+            
+            // Check if this candidate is within reasonable range (not an outlier)
+            double score_diff = std::abs(candidate.normalized_score - mean_score);
+            bool is_reasonable = (std_dev == 0.0) || (score_diff <= std_dev * 1.5);
+            
+            if (is_reasonable && candidate.normalized_score > best_consensus_score) {
+                best_consensus_score = candidate.normalized_score;
+                best_consensus_idx = i;
+            }
+        }
+        
+        // Strategy 2: If no consensus found, look for common prefixes
+        if (best_consensus_score == -INFINITY && slot.beam_candidates.size() > 1) {
+            // Find the candidate whose text has the most overlap with other candidates
+            size_t best_overlap_idx = 0;
+            size_t max_total_overlap = 0;
+            
+            for (size_t i = 0; i < slot.beam_candidates.size(); i++) {
+                size_t total_overlap = 0;
+                const std::string& text_i = slot.beam_candidates[i].generated_text;
+                
+                for (size_t j = 0; j < slot.beam_candidates.size(); j++) {
+                    if (i == j) continue;
+                    
+                    const std::string& text_j = slot.beam_candidates[j].generated_text;
+                    
+                    // Calculate common prefix length
+                    size_t common_len = 0;
+                    size_t min_len = std::min(text_i.length(), text_j.length());
+                    
+                    for (size_t k = 0; k < min_len; k++) {
+                        if (text_i[k] == text_j[k]) {
+                            common_len++;
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    total_overlap += common_len;
+                }
+                
+                if (total_overlap > max_total_overlap) {
+                    max_total_overlap = total_overlap;
+                    best_overlap_idx = i;
+                }
+            }
+            
+            return best_overlap_idx;
+        }
+        
+        return best_consensus_idx;
+    }
+
     // Calculate approximate memory usage of beam candidates in bytes
     size_t _beam_search_estimate_memory_usage(const server_slot &slot) {
         size_t total_bytes = 0;
@@ -3151,14 +3252,27 @@ private:
         return candidates_probs;
     }
 
-    // Expand beam candidates with new tokens
+    // Expand beam candidates with new tokens (deterministic expansion)
     void _beam_search_expand_candidates(
         server_slot &slot,
         llama_token_data_array * candidates_probs,
         std::vector<server_slot::beam_candidate> &new_candidates,
         const std::function<bool(server_slot &, llama_token)>& accept_special_token_fn
     ) {
+        // Use appropriate expansion strategy based on deterministic setting
         const size_t top_k_expansion = std::min((size_t)(slot.params.beam_width * 2), candidates_probs->size);
+
+        // Sort candidates for deterministic selection if enabled
+        if (slot.params.beam_deterministic) {
+            std::sort(candidates_probs->data, candidates_probs->data + candidates_probs->size,
+                [](const llama_token_data& a, const llama_token_data& b) {
+                    if (std::abs(a.p - b.p) > 1e-9) {
+                        return a.p > b.p; // Higher probability first
+                    }
+                    return a.id < b.id; // Deterministic tie-breaking by token ID
+                });
+        }
+        // For non-deterministic mode, candidates are already sorted by the sampler
 
         for (const auto& current_beam : slot.beam_candidates) {
             // Skip finished beams if early stopping is enabled
@@ -3216,14 +3330,31 @@ private:
         server_slot &slot,
         std::vector<server_slot::beam_candidate> &candidates
     ) {
-        // Sort candidates by normalized score (higher is better)
+        // Sort candidates by normalized score (higher is better) with deterministic tie-breaking
         std::sort(candidates.begin(), candidates.end(),
             [](const server_slot::beam_candidate& a, const server_slot::beam_candidate& b) {
                 // Handle NaN and -Infinity cases for robust sorting
                 if (std::isnan(a.normalized_score) || std::isnan(b.normalized_score)) return false;
                 if (std::isinf(a.normalized_score) && a.normalized_score < 0) return false;
                 if (std::isinf(b.normalized_score) && b.normalized_score < 0) return true;
-                return a.normalized_score > b.normalized_score;
+                
+                // Primary sort: by normalized score (higher is better)
+                if (std::abs(a.normalized_score - b.normalized_score) > 1e-9) {
+                    return a.normalized_score > b.normalized_score;
+                }
+                
+                // Tie-breaking 1: by raw log probability (higher is better)
+                if (std::abs(a.log_probability - b.log_probability) > 1e-9) {
+                    return a.log_probability > b.log_probability;
+                }
+                
+                // Tie-breaking 2: by generation length (shorter is better for same score)
+                if (a.generation_length != b.generation_length) {
+                    return a.generation_length < b.generation_length;
+                }
+                
+                // Tie-breaking 3: by lexicographic order of generated text (deterministic)
+                return a.generated_text < b.generated_text;
             });
 
         // Early stopping: if we have enough finished candidates, keep only finished ones
@@ -3299,13 +3430,20 @@ private:
             slot.beam_candidates.resize(emergency_size);
         }
 
-        // Return the best token for the next step
-        if (slot.beam_candidates.empty() || slot.beam_candidates[0].tokens.empty()) {
+        // Return the best token for the next step using consensus beam
+        if (slot.beam_candidates.empty()) {
             SLT_ERR(slot, "No valid beam candidates after processing%s", "");
             return llama_vocab_eos(this->vocab);
         }
 
-        llama_token best_token = slot.beam_candidates[0].tokens.back();
+        // Find consensus beam for token selection
+        size_t consensus_idx = _beam_search_find_consensus_beam(slot);
+        if (consensus_idx >= slot.beam_candidates.size() || slot.beam_candidates[consensus_idx].tokens.empty()) {
+            SLT_ERR(slot, "Invalid consensus beam candidate%s", "");
+            return llama_vocab_eos(this->vocab);
+        }
+
+        llama_token best_token = slot.beam_candidates[consensus_idx].tokens.back();
         
         // Log memory usage periodically
         if (slot.n_decoded % 10 == 0) {
@@ -3314,9 +3452,9 @@ private:
                   slot.n_decoded, memory_mb, slot.beam_candidates.size());
         }
         
-        SRV_DBG("Beam search: selected token %d ('%s') with score %.6f",
+        SRV_DBG("Beam search: selected token %d ('%s') from consensus beam %zu (score: %.6f)",
               best_token, common_token_to_piece(this->ctx, best_token).c_str(),
-              slot.beam_candidates[0].normalized_score);
+              consensus_idx, slot.beam_candidates[consensus_idx].normalized_score);
 
         return best_token;
     }
@@ -4861,7 +4999,7 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE); // infill is not OAI compatible
     };
 
-    const auto handle_chat_completions = [&ctx_server, &res_error, &handle_completions_impl, &params](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_chat_completions = [&ctx_server, &res_error, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         LOG_DBG("request: %s\n", req.body.c_str());
         if (ctx_server.params_base.embedding) {
             res_error(res, format_error_response("This server does not support completions. Start it without `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));

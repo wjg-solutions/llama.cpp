@@ -225,6 +225,7 @@ struct common_params {
     float   beam_length_penalty   =  1.0f; // length normalization penalty for beam search (1.0 = no penalty)
     float   beam_diversity_penalty=  0.0f; // diversity penalty for beam search (0.0 = no penalty)
     bool    beam_early_stopping   =  true; // enable early stopping in beam search
+    bool    beam_deterministic    = false; // enable deterministic beam search with consistent tie-breaking
     int32_t n_ctx                 =  4096; // context size
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)

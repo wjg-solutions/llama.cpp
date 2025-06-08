@@ -1468,6 +1468,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_BEAM_EARLY_STOPPING"));
     add_opt(common_arg(
+        {"--beam-deterministic"},
+        string_format("enable deterministic beam search with consistent tie-breaking (default: %s)", params.beam_deterministic ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.beam_deterministic = true;
+        }
+    ).set_env("LLAMA_ARG_BEAM_DETERMINISTIC"));
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

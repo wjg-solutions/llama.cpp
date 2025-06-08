@@ -2530,7 +2530,16 @@ struct server_context {
             // Find the consensus beam for streaming
             size_t consensus_idx = _beam_search_find_consensus_beam(slot);
             const auto& consensus_candidate = slot.beam_candidates[consensus_idx];
-            res->content = consensus_candidate.generated_text.substr(slot.n_sent_text);
+            
+            // Add bounds checking to prevent std::out_of_range exception
+            if (slot.n_sent_text <= consensus_candidate.generated_text.length()) {
+                res->content = consensus_candidate.generated_text.substr(slot.n_sent_text);
+            } else {
+                // Fallback: send only the new token if bounds are exceeded
+                res->content = tkn.text_to_send;
+                SRV_WRN("Beam streaming: bounds exceeded (n_sent_text=%zu > text_length=%zu), falling back to token text",
+                       slot.n_sent_text, consensus_candidate.generated_text.length());
+            }
             res->tokens  = { tkn.tok }; // Still send the current token for compatibility
             
             SRV_DBG("Beam streaming: sending partial text from consensus candidate %zu (score: %.6f)",
